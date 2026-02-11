@@ -1,0 +1,5 @@
+sample	fq1	fq2
+EGAR00002831122	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831122_R1.fastq.gz	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831122_R2.fastq.gz
+EGAR00002831123	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831123_R1.fastq.gz	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831123_R2.fastq.gz
+EGAR00002831124	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831124_R1.fastq.gz	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831124_R2.fastq.gz
+EGAR00002831125	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831125_R1.fastq.gz	/fs/scratch/PDE0005/ImmunoLungSamples/Rawdata/FASTQ_RENAMED/EGAR00002831125_R2.fastq.gz
