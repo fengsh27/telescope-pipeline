@@ -195,6 +195,7 @@ class PatchedWorker:
     def get_fastqgz_nrows(self, fpath: str) -> int:
         if not os.path.isfile(fpath):
             return 0
+        i = -1
         with gzip.open(fpath, 'rb') as f:
             for i, _ in enumerate(f):
                 pass
@@ -211,12 +212,43 @@ class PatchedWorker:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"command '{e.cmd}' return with error (code {e.returncode}): {e.output}")
 
+    @staticmethod
+    def _detect_input(o_dpath: str, sample: str, read_no: int) -> str:
+        suffixes = [
+            f"_{read_no}.fq.gz",
+            f"_R{read_no}.fq.gz",
+            f"_{read_no}.fastq.gz",
+            f"_R{read_no}.fastq.gz",
+        ]
+        for suffix in suffixes:
+            candidate = os.path.join(o_dpath, f"{sample}{suffix}")
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(
+            f"Missing FASTQ for sample '{sample}' read {read_no} in {o_dpath}"
+        )
+
     def fastq_trimming(self, sample_info: Dict[str, Any], fastq_dpath: str, n_cores: int, sample: str) -> Dict[str, Any]:
         """ Trimgalore trimming """
         s_time = time.time()
         cols = ['status', 'note', 'sample_id', 'cohort_id', 'R1_trim_size', 'R2_trim_size', 'fastqtrim_time_in_sec']
 
         o_dpath = os.path.join(fastq_dpath, sample)
+
+        def _trimmed_output_name(input_path: str, read_no: int) -> str:
+            base = os.path.basename(input_path)
+            if base.endswith('.fastq.gz'):
+                stem = base[:-len('.fastq.gz')]
+                ext = '.fastq.gz'
+            elif base.endswith('.fq.gz'):
+                stem = base[:-len('.fq.gz')]
+                ext = '.fq.gz'
+            else:
+                raise ValueError(f"Unexpected FASTQ extension: {base}")
+            return os.path.join(o_dpath, f"{stem}_val_{read_no}{ext}")
+
+        r1_input = self._detect_input(o_dpath, sample, 1)
+        r2_input = self._detect_input(o_dpath, sample, 2)
         cmd = (
             "trim_galore "
             "--paired "
@@ -224,8 +256,8 @@ class PatchedWorker:
             "--gzip "
             f"--cores {n_cores} "
             f"-o {o_dpath} "
-            f"{os.path.join(o_dpath, f'{sample}_R1.fq.gz')} "
-            f"{os.path.join(o_dpath, f'{sample}_R2.fq.gz')}"
+            f"{r1_input} "
+            f"{r2_input}"
         )
         try:
             log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
@@ -235,11 +267,24 @@ class PatchedWorker:
             raise RuntimeError(f"command '{e.cmd}' return with error (code {e.returncode}): {e.output}")
 
         # Normalize output filenames back to <sample>_R1/_R2
-        for file in os.listdir(o_dpath):
-            if file.endswith(f'{sample}_R1_val_1.fq.gz'):
-                os.rename(os.path.join(o_dpath, file), os.path.join(o_dpath, f'{sample}_R1.fq.gz'))
-            elif file.endswith(f'{sample}_R2_val_2.fq.gz'):
-                os.rename(os.path.join(o_dpath, file), os.path.join(o_dpath, f'{sample}_R2.fq.gz'))
+        r1_trimmed = _trimmed_output_name(r1_input, 1)
+        r2_trimmed = _trimmed_output_name(r2_input, 2)
+
+        if not os.path.isfile(r1_trimmed) or not os.path.isfile(r2_trimmed):
+            raise FileNotFoundError(
+                f"Trimmed FASTQ not found for sample '{sample}' in {o_dpath}"
+            )
+
+        r1_dst = os.path.join(o_dpath, f'{sample}_R1.fq.gz')
+        r2_dst = os.path.join(o_dpath, f'{sample}_R2.fq.gz')
+
+        if os.path.isfile(r1_dst):
+            os.remove(r1_dst)
+        if os.path.isfile(r2_dst):
+            os.remove(r2_dst)
+
+        os.rename(r1_trimmed, r1_dst)
+        os.rename(r2_trimmed, r2_dst)
 
         r1 = os.path.getsize(os.path.join(o_dpath, f'{sample}_R1.fq.gz')) if os.path.isfile(os.path.join(o_dpath, f'{sample}_R1.fq.gz')) else 0
         r2 = os.path.getsize(os.path.join(o_dpath, f'{sample}_R2.fq.gz')) if os.path.isfile(os.path.join(o_dpath, f'{sample}_R2.fq.gz')) else 0
