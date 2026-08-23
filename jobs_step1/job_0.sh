@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --mem=256G
+#SBATCH --mem=64G
 #SBATCH --job-name=immuno_retrovirus
 #SBATCH --account=PDE0005
 #SBATCH --error=immuno_retrovirus-%j.err

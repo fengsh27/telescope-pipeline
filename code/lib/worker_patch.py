@@ -360,51 +360,56 @@ class PatchedWorker:
             self.delete_file_or_dir(telescope_dpath)
         self.create_dir(telescope_dpath)
 
+        # Align and coordinate-sort in a single pass. The intermediate SAM is
+        # no longer written: bowtie2 streams straight into samtools sort, which
+        # removes ~1 TB of write-then-read per large sample. This produces a
+        # byte-identical BAM to the previous
+        #   bowtie2 -S x.sam ; samtools view -bS x.sam | samtools sort
+        # path, and samtools sort output does not depend on -@ or -m (stable
+        # mergesort), so results stay consistent with previously profiled
+        # samples.
+        #
+        # Two details matter here:
+        #   * bowtie2 writes its summary to stderr and the SAM to stdout, so
+        #     the two must be kept apart - merging them corrupts the stream.
+        #   * pipefail is required because a shell pipeline reports only the
+        #     LAST command's exit status. Without it, a bowtie2 failure part
+        #     way through leaves samtools sort writing a valid but truncated
+        #     BAM and exiting 0, i.e. silently incomplete counts.
+        sort_n_cores = max(2, n_cores // 3)
+        sort_mem = '3G'
+        bt2_log_fpath = os.path.join(telescope_dpath, f'{sample}_bowties2.log')
+        bam_fpath = os.path.join(telescope_dpath, f'{sample}.bam')
         cmd = (
+            "set -o pipefail; "
             "bowtie2 "
             "-k 100 "
             f"-p {n_cores} "
             f"-x {genome_fpath} "
             f"-1 {os.path.join(fastq_dpath, sample, f'{sample}_R1.fq.gz')} "
             f"-2 {os.path.join(fastq_dpath, sample, f'{sample}_R2.fq.gz')} "
-            f"-S {os.path.join(telescope_dpath, f'{sample}.sam')} "
-            f"--seed {self.seed}"
+            f"--seed {self.seed} "
+            f"2> {bt2_log_fpath} "
+            "| "
+            "samtools sort "
+            f"-@ {sort_n_cores} "
+            f"-m {sort_mem} "
+            f"-o {bam_fpath} "
+            "-"
         )
         print(cmd)
-        log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
-        with open(os.path.join(telescope_dpath, f'{sample}_bowties2.log'), 'w') as f:
-            f.write(log.decode('utf-8'))
-
-        sam_fpath = os.path.join(telescope_dpath, f'{sample}.sam')
-        if not os.path.isfile(sam_fpath):
-            d = {
-                'status': 'Err', 'note': 'No SAM file found',
-                'sample_id': sample, 'cohort_id': sample_info[sample].get('cohort_id', ''),
-                'bowties2': 'Err', 'bowties2_sam_size': 0,
-                'bowties2_time_in_sec': round(time.time() - s_time, 2),
-                'samtools_sam_to_bam': '', 'samtools_bam_size': 0,
-                'samtools_sam_to_bam_time_in_sec': .0,
-                'samtools_bai': '', 'samtools_bai_time_in_sec': .0
-            }
-            print('\t'.join([str(d[c]) for c in cols]))
-            return d
-
-        bowties2_sam_size = os.path.getsize(sam_fpath)
-        bowties2_sam_time = round(time.time() - s_time, 2)
-
-        # Sort BAM
-        s_time = time.time()
-        cmd = (
-            "samtools view "
-            f"-@ {n_cores} "
-            f"-bS {os.path.join(telescope_dpath, f'{sample}.sam')} "
-            "| "
-            "samtools sort -o "
-            f"{os.path.join(telescope_dpath, f'{sample}.bam')}"
-        )
-        log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
+        log = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, shell=True, executable='/bin/bash')
         with open(os.path.join(telescope_dpath, f'{sample}_sam_to_sorted_bam.log'), 'w') as f:
             f.write(log.decode('utf-8'))
+
+        # No SAM is materialised any more. The column is retained at 0 so the
+        # logs_*.tsv schema stays identical to the previously profiled samples.
+        # Align+sort is now one fused step, so its wall time is reported under
+        # bowties2_time_in_sec and samtools_sam_to_bam_time_in_sec is ~0.
+        bowties2_sam_size = 0
+        bowties2_sam_time = round(time.time() - s_time, 2)
+        s_time = time.time()
 
         bam_fpath = os.path.join(telescope_dpath, f'{sample}.bam')
         if not os.path.isfile(bam_fpath):
@@ -422,10 +427,6 @@ class PatchedWorker:
 
         samtools_bam_size = os.path.getsize(bam_fpath)
         samtools_bam_time = round(time.time() - s_time, 2)
-
-        # Remove SAM to save space
-        if os.path.isfile(sam_fpath):
-            self.delete_file_or_dir(sam_fpath)
 
         # Index BAM
         s_time = time.time()
