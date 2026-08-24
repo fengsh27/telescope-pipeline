@@ -159,6 +159,14 @@ class CmdParser():
         )
 
         cmd_args.add_argument(
+            '--telescope_n_samples',
+            type=int,
+            default=1,
+            required=False,
+            help='Number of samples to run through Telescope concurrently (default: 1)'
+        )
+
+        cmd_args.add_argument(
             '--seed', 
             type=int, 
             default=123456, 
@@ -213,6 +221,7 @@ class CmdParser():
         self.sample_check_n_cores: int = args.sample_check_n_cores
         self.trimgalore_n_cores: int = args.trimgalore_n_cores
         self.telescope_n_cores: int = args.telescope_n_cores
+        self.telescope_n_samples: int = args.telescope_n_samples
         self.seed: int = args.seed
         self.manifest: str = args.manifest
         self.samples_dir: str = args.samples_dir

@@ -83,7 +83,7 @@ class PatchedWorker:
         self.workflows: List[str] = list(self.cmd_obj.workflows)
         self.check_strand_n_workers: int = 2
         self.fastq_samples_limit: int = 6
-        self.bam_samples_limit: int = 1
+        self.bam_samples_limit: int = max(1, getattr(self.cmd_obj, 'telescope_n_samples', 1))
 
         # NEW: manifest + samples_dir
         self.manifest_tsv: str = getattr(self.cmd_obj, 'manifest', '')
