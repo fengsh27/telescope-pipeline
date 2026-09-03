@@ -1,0 +1,35 @@
+{
+  "project":      "/fs/scratch/PDE0005/projects/MYPROJECT",
+  "samples_dir":  "/fs/ess/PDE0005/USER/MYPROJECT/fastq",
+  "code_dir":     "/fs/scratch/PDE0005/projects/MYPROJECT/code",
+  "ref_dir":      "/fs/ess/PDE0005/telescope_refs/data/REF",
+  "index_dir":    "/fs/ess/PDE0005/telescope_refs/data/Indexes",
+
+  "account":      "PDE0005",
+  "partition":    "nextgen",
+  "job_prefix":   "myproj",
+  "conda_env":    "immuno_telescope",
+  "seed":         123456,
+
+  "samples_per_manifest": 4,
+
+  "s1_cpus": 24, "s1_mem": "64G",  "s1_time": "96:00:00",
+  "s2_cpus": 12, "s2_mem": "47G",  "s2_time": "144:00:00",
+  "s2_concurrent": 4,
+
+  "trimgalore_n_cores": 6,
+  "sample_check_n_cores": 6,
+
+  "fastq_suffix_1": "_1.fastq.gz",
+  "fastq_suffix_2": "_2.fastq.gz",
+
+  "gtf":        "gencode.v39.annotation.gtf",
+  "genome":     "GRCh38.p13.genome.chr.fa",
+  "transcript": "gencode.v39.transcripts.fa",
+  "herv_gtf":   "HG38_HERV_LINE_all_families_telescope_ann.gtf",
+  "bowtie2_idx": "gencode.v39_bowtie2/human",
+
+  "intel_module":  "intel/2021.10.0",
+  "conda_module":  "miniconda3/24.1.2-py310",
+  "intel_cmplr_root": "/apps/spack/0.21/ascend/linux-rhel9-zen2/intel-oneapi-compilers/gcc/11.4.1/2023.2.3-nkzjnam/compiler/2023.2.3"
+}

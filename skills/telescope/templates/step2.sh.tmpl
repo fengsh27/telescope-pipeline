@@ -1,0 +1,89 @@
+#!/bin/bash
+#SBATCH --job-name={{JOB_NAME}}
+#SBATCH --account={{ACCOUNT}}
+#SBATCH --partition={{PARTITION}}
+#SBATCH --time={{S2_TIME}}
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task={{S2_CPUS}}
+#SBATCH --mem={{S2_MEM}}
+#SBATCH --gres=pfsdir:scratch
+#SBATCH --output={{PROJECT}}/logs/step2/job_{{ID}}-%j.out
+#SBATCH --error={{PROJECT}}/logs/step2/job_{{ID}}-%j.err
+
+set -euo pipefail
+set -x
+
+module load {{INTEL_MODULE}}
+module load {{CONDA_MODULE}}
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate {{CONDA_ENV}}
+
+# Telescope's C extension needs the Intel runtime libs on the path.
+CMPLR_ROOT="{{INTEL_CMPLR_ROOT}}"
+INTEL64="$CMPLR_ROOT/linux/compiler/lib/intel64_lin"
+export LD_LIBRARY_PATH="$INTEL64:$CMPLR_ROOT/linux/lib:$CMPLR_ROOT/linux/lib/x64:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+export LD_PRELOAD="$INTEL64/libimf.so:$INTEL64/libsvml.so:$INTEL64/libirc.so"
+
+# Fail in the first second rather than six hours in if the .so cannot load.
+python - <<'PY' || exit 1
+import ctypes, glob, os, sys
+p = glob.glob(os.path.join(
+    os.environ["CONDA_PREFIX"], "lib", "python*", "site-packages",
+    "telescope", "utils", "calignment*.so"))
+if not p:
+    sys.exit("Telescope extension not found")
+ctypes.CDLL(p[0])
+print("Loaded Telescope extension OK:", p[0])
+PY
+
+PROJECT_PATH="{{PROJECT}}"
+
+cp -R "{{CODE_DIR}}/lib" "{{CODE_DIR}}/run.py" "${PFSDIR}/"
+cd "${PFSDIR}"
+mkdir -p output
+
+python run.py \
+  --gtf "{{REF_DIR}}/{{GTF}}" \
+  --genome "{{REF_DIR}}/{{GENOME}}" \
+  --transcript "{{REF_DIR}}/{{TRANSCRIPT}}" \
+  --herv_gtf "{{REF_DIR}}/{{HERV_GTF}}" \
+  --bowtiew2_idx "{{INDEX_DIR}}/{{BOWTIE2_IDX}}" \
+  --workflows TELESCOPE \
+  --out_dir output \
+  --scratch_dir "${PROJECT_PATH}/tmp_{{ID}}" \
+  --n_cores "${SLURM_CPUS_PER_TASK}" \
+  --trimgalore_n_cores {{TRIMGALORE_N_CORES}} \
+  --telescope_n_cores 1 \
+  --telescope_n_samples {{S2_CONCURRENT}} \
+  --seed {{SEED}} \
+  --fastq_mode && rc=0 || rc=$?
+
+# Copy results back even if run.py died: samples that finished cost days of CPU
+# and must not be discarded because a later sample in the same manifest failed.
+mkdir -p "${PROJECT_PATH}/output/TELESCOPE"
+if [ -f output/logs.tsv ]; then
+  cp output/logs.tsv "${PROJECT_PATH}/output/TELESCOPE/logs_{{ID}}.tsv"
+fi
+if [ -d output/TELESCOPE ]; then
+  rsync -a output/TELESCOPE/ "${PROJECT_PATH}/output/TELESCOPE/"
+fi
+
+# Only reclaim the BAMs once every sample in this manifest produced a counts file.
+missing=0
+while IFS=$'\t' read -r s _; do
+  [ "$s" = "sample" ] && continue
+  [ -s "${PROJECT_PATH}/output/TELESCOPE/${s}/${s}-TE_counts.tsv" ] || { echo "MISSING counts: $s"; missing=1; }
+done < "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv"
+
+if [ "$missing" -eq 0 ] && [ "$rc" -eq 0 ]; then
+  rm -rf "${PROJECT_PATH}/tmp_{{ID}}"
+  echo "tmp_{{ID}} reclaimed"
+else
+  echo "tmp_{{ID}} KEPT for rerun (run.py rc=$rc, missing=$missing)"
+fi
+
+# Surface the failure to Slurm only after everything has been copied back.
+if [ "$missing" -ne 0 ] || [ "$rc" -ne 0 ]; then
+  exit 1
+fi
