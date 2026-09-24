@@ -22,7 +22,7 @@ DEFAULTS = {
     "fastq_suffix_1": "_1.fastq.gz",
     "fastq_suffix_2": "_2.fastq.gz",
     "gtf": "gencode.v39.annotation.gtf",
-    "genome": "GRCh38.p13.genome.fa",
+    "genome": "GRCh38.p13.genome.chr.fa",
     "transcript": "gencode.v39.transcripts.fa",
     "herv_gtf": "HG38_HERV_LINE_all_families_telescope_ann.gtf",
     "bowtie2_idx": "gencode.v39_bowtie2/human",
