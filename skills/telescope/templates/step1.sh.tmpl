@@ -24,7 +24,7 @@ SAMPLES_PATH="{{SAMPLES_DIR}}"
 # tmp_{{ID}} holds the BAMs handed to step 2; it must survive this job.
 mkdir -p "${PROJECT_PATH}/tmp_{{ID}}"
 
-# Everything heavy (staged FASTQ, trimmed FASTQ, the SAM) lives on the job-private
+# Everything heavy (staged FASTQ, trimmed FASTQ) lives on the job-private
 # pfsdir and is discarded at job end. Only the BAM is moved to tmp_{{ID}}.
 cp -R "{{CODE_DIR}}/lib" "{{CODE_DIR}}/run.py" \
       "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv" "${PFSDIR}/"

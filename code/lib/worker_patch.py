@@ -43,6 +43,7 @@ import json
 import math
 import os
 import pandas as pd
+import pysam
 from shutil import move, rmtree, copyfileobj, copyfile
 import subprocess
 import sys
@@ -360,24 +361,24 @@ class PatchedWorker:
             self.delete_file_or_dir(telescope_dpath)
         self.create_dir(telescope_dpath)
 
-        # Align and coordinate-sort in a single pass. The intermediate SAM is
-        # no longer written: bowtie2 streams straight into samtools sort, which
-        # removes ~1 TB of write-then-read per large sample. This produces a
-        # byte-identical BAM to the previous
-        #   bowtie2 -S x.sam ; samtools view -bS x.sam | samtools sort
-        # path, and samtools sort output does not depend on -@ or -m (stable
-        # mergesort), so results stay consistent with previously profiled
-        # samples.
+        # Align and compress to BAM in a single pass, in bowtie2's own output
+        # order. Do NOT coordinate-sort this BAM: Telescope groups a fragment's
+        # alignments by taking CONSECUTIVE records with the same query name
+        # (telescope.utils.alignment.fetch_bundle). bowtie2 already emits every
+        # alignment of a read pair as one contiguous block (also with -p > 1),
+        # which is exactly what Telescope needs; `samtools sort -n` gives
+        # identical counts at the cost of a full sort. A coordinate sort
+        # scatters each read's alignments, so nearly every record became its
+        # own fragment and multi-mappers were counted as unique.
         #
         # Two details matter here:
         #   * bowtie2 writes its summary to stderr and the SAM to stdout, so
         #     the two must be kept apart - merging them corrupts the stream.
         #   * pipefail is required because a shell pipeline reports only the
         #     LAST command's exit status. Without it, a bowtie2 failure part
-        #     way through leaves samtools sort writing a valid but truncated
+        #     way through leaves samtools view writing a valid but truncated
         #     BAM and exiting 0, i.e. silently incomplete counts.
-        sort_n_cores = max(2, n_cores // 3)
-        sort_mem = '3G'
+        view_n_cores = max(2, n_cores // 6)
         bt2_log_fpath = os.path.join(telescope_dpath, f'{sample}_bowties2.log')
         bam_fpath = os.path.join(telescope_dpath, f'{sample}.bam')
         cmd = (
@@ -391,21 +392,21 @@ class PatchedWorker:
             f"--seed {self.seed} "
             f"2> {bt2_log_fpath} "
             "| "
-            "samtools sort "
-            f"-@ {sort_n_cores} "
-            f"-m {sort_mem} "
+            "samtools view "
+            "-b "
+            f"-@ {view_n_cores} "
             f"-o {bam_fpath} "
             "-"
         )
         print(cmd)
         log = subprocess.check_output(
             cmd, stderr=subprocess.STDOUT, shell=True, executable='/bin/bash')
-        with open(os.path.join(telescope_dpath, f'{sample}_sam_to_sorted_bam.log'), 'w') as f:
+        with open(os.path.join(telescope_dpath, f'{sample}_sam_to_bam.log'), 'w') as f:
             f.write(log.decode('utf-8'))
 
         # No SAM is materialised any more. The column is retained at 0 so the
         # logs_*.tsv schema stays identical to the previously profiled samples.
-        # Align+sort is now one fused step, so its wall time is reported under
+        # Align+compress is one fused step, so its wall time is reported under
         # bowties2_time_in_sec and samtools_sam_to_bam_time_in_sec is ~0.
         bowties2_sam_size = 0
         bowties2_sam_time = round(time.time() - s_time, 2)
@@ -428,44 +429,18 @@ class PatchedWorker:
         samtools_bam_size = os.path.getsize(bam_fpath)
         samtools_bam_time = round(time.time() - s_time, 2)
 
-        # Index BAM
-        s_time = time.time()
-        cmd = (
-            "samtools index "
-            f"-@ {n_cores} "
-            f"{os.path.join(telescope_dpath, f'{sample}.bam')} "
-            f"{os.path.join(telescope_dpath, f'{sample}.bam.bai')}"
-        )
-        log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
-        with open(os.path.join(telescope_dpath, f'{sample}_samtools_bai.log'), 'w') as f:
-            f.write(log.decode('utf-8'))
-
-        bai_fpath = os.path.join(telescope_dpath, f'{sample}.bam.bai')
-        if not os.path.isfile(bai_fpath):
-            d = {
-                'status': 'Err', 'note': 'No BAM.BAI file found',
-                'sample_id': sample, 'cohort_id': sample_info[sample].get('cohort_id', ''),
-                'bowties2': 'Ok', 'bowties2_sam_size': bowties2_sam_size,
-                'bowties2_time_in_sec': bowties2_sam_time,
-                'samtools_sam_to_bam': 'Ok', 'samtools_bam_size': samtools_bam_size,
-                'samtools_sam_to_bam_time_in_sec': samtools_bam_time,
-                'samtools_bai': 'Err', 'samtools_bai_time_in_sec': round(time.time() - s_time, 2)
-            }
-            print('\t'.join([str(d[c]) for c in cols]))
-            return d
+        # No index: a BAM in aligner order cannot be indexed, and Telescope
+        # reads it front to back (until_eof) so it does not need one. The
+        # samtools_bai columns are kept as 'Skipped' for schema stability.
 
         # Move into scratch for Telescope stage
         src_fpath = os.path.join(telescope_dpath, f'{sample}.bam')
         dst_fpath = os.path.join(scratch_dpath, f'{sample}.bam')
         move(src_fpath, dst_fpath)
-        src_fpath = os.path.join(telescope_dpath, f'{sample}.bam.bai')
-        dst_fpath = os.path.join(scratch_dpath, f'{sample}.bam.bai')
-        move(src_fpath, dst_fpath)
 
         # Clean remaining duplicates if any
-        for fp in (os.path.join(telescope_dpath, f'{sample}.bam'), os.path.join(telescope_dpath, f'{sample}.bam.bai')):
-            if os.path.exists(fp):
-                self.delete_file_or_dir(fp)
+        if os.path.exists(src_fpath):
+            self.delete_file_or_dir(src_fpath)
 
         d = {
             'status': 'Ok', 'note': '', 'sample_id': sample,
@@ -474,7 +449,7 @@ class PatchedWorker:
             'bowties2_time_in_sec': bowties2_sam_time,
             'samtools_sam_to_bam': 'Ok', 'samtools_bam_size': samtools_bam_size,
             'samtools_sam_to_bam_time_in_sec': samtools_bam_time,
-            'samtools_bai': 'Ok', 'samtools_bai_time_in_sec': round(time.time() - s_time, 2)
+            'samtools_bai': 'Skipped', 'samtools_bai_time_in_sec': .0
         }
         print('\t'.join([str(d[c]) for c in cols]))
         return d
@@ -489,6 +464,17 @@ class PatchedWorker:
         if os.path.isdir(tmp_dpath):
             self.delete_file_or_dir(tmp_dpath)
         self.create_dir(tmp_dpath)
+
+        # Refuse a coordinate-sorted BAM (e.g. one left in tmp_<N> by an older
+        # step 1): Telescope would run to completion on it and silently treat
+        # each alignment record as its own fragment.
+        bam_fpath = os.path.join(telescope_dpath, f'{sample}.bam')
+        with pysam.AlignmentFile(bam_fpath, check_sq=False) as bam:
+            sort_order = bam.header.to_dict().get('HD', {}).get('SO', '')
+        if sort_order == 'coordinate':
+            raise RuntimeError(
+                f"{sample}: {bam_fpath} is coordinate-sorted; Telescope needs each "
+                "read's alignments contiguous. Re-run step 1 for this sample.")
 
         cmd = (
             "telescope assign "
@@ -529,12 +515,11 @@ class PatchedWorker:
         return [samples[i:i + chunk_size] for i in range(0, len(samples), chunk_size)]
 
     def prepare_telescope_samples_info_from_scratch(self, scratch_path: str) -> Dict[str, Any]:
-        """Discover samples that have BAM+BAI in scratch (output of Bowtie2 stage)."""
+        """Discover samples that have a BAM in scratch (output of Bowtie2 stage)."""
         info: Dict[str, Any] = {}
         for bam in glob.glob(os.path.join(scratch_path, '*.bam')):
             sample = os.path.basename(bam).replace('.bam', '')
-            bai = os.path.join(scratch_path, f'{sample}.bam.bai')
-            if os.path.isfile(bam) and os.path.isfile(bai):
+            if os.path.isfile(bam):
                 info[sample] = {'sample_id': sample, 'cohort_id': ''}
         return info
 
@@ -661,14 +646,12 @@ class PatchedWorker:
 
             for sample, info in sample_info_tele.items():
                 bam_fpath = os.path.join(scratch_path, f'{sample}.bam')
-                bai_fpath = os.path.join(scratch_path, f'{sample}.bam.bai')
-                if os.path.isfile(bam_fpath) and os.path.isfile(bai_fpath):
+                if os.path.isfile(bam_fpath):
                     tele_dpath = os.path.join(o_path, 'TELESCOPE', sample)
                     if os.path.isdir(tele_dpath):
                         self.delete_file_or_dir(tele_dpath)
                     self.create_dir(tele_dpath)
                     copyfile(bam_fpath, os.path.join(tele_dpath, f'{sample}.bam'))
-                    copyfile(bai_fpath, os.path.join(tele_dpath, f'{sample}.bam.bai'))
                     init_samples.append(sample)
                     logs_map.setdefault(sample, {
                         'status': 'Ok', 'note': '', 'sample_id': sample, 'cohort_id': info.get('cohort_id', '')

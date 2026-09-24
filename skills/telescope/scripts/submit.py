@@ -113,8 +113,6 @@ def preflight(cfg, step, ids, queued):
                     continue
                 if not os.path.isfile(bam) or os.path.getsize(bam) == 0:
                     probs.append(f"missing BAM for {s}: {bam}")
-                elif not os.path.isfile(bam + ".bai"):
-                    probs.append(f"missing index: {bam}.bai")
                 else:
                     nbytes += os.path.getsize(bam)
             if done == len(rows):

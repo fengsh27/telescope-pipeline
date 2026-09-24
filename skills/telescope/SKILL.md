@@ -9,7 +9,7 @@ Two steps, one manifest at a time:
 
 | step | workflow | reads | writes | typical cost |
 |------|----------|-------|--------|--------------|
-| 1 | `BOWTIE` | `<sample>_1.fastq.gz` / `_2.fastq.gz` | `tmp_<N>/<sample>.bam` + `.bai` | 24 cpu, 64 G, ~12–36 h |
+| 1 | `BOWTIE` | `<sample>_1.fastq.gz` / `_2.fastq.gz` | `tmp_<N>/<sample>.bam` (aligner order, no index) | 24 cpu, 64 G, ~12–36 h |
 | 2 | `TELESCOPE` | `tmp_<N>/*.bam` | `output/TELESCOPE/<sample>/<sample>-TE_counts.tsv` | 12 cpu, 47 G, 1–3 days |
 
 Step 2 deletes `tmp_<N>` only after every sample in that manifest has a counts
@@ -113,7 +113,7 @@ Preflight runs first and aborts the whole batch if anything fails:
 |-------|--------|--------|
 | job script exists and `bash -n` passes | ✓ | ✓ |
 | manifest exists | ✓ | ✓ |
-| every input present and non-empty | FASTQ pairs | `tmp_<N>/<s>.bam` + `.bai` |
+| every input present and non-empty | FASTQ pairs | `tmp_<N>/<s>.bam` |
 | output not already complete | — | `-TE_counts.tsv` absent |
 | not already in the queue | ✓ | ✓ |
 | resource directives uniform across the batch | ✓ | ✓ |
@@ -146,29 +146,36 @@ range — it is how the jobs are found later with `sacct`.
   failure. A one-sample failure previously discarded a whole manifest's worth
   of finished work. Keep that ordering in any template edit.
 
-## Known upstream defect: fragment bundling
+## BAM order: never coordinate-sort the step-1 BAM
 
-`alignment.fetch_bundle` groups **consecutive** records by `query_name`, but
-step 1 pipes bowtie2 through `samtools sort` (coordinate order). Records for
-one read end up scattered, so nearly every alignment record is treated as its
-own fragment.
+Telescope's `alignment.fetch_bundle` groups **consecutive** records by
+`query_name`, so all alignments of a read pair must be contiguous. Bowtie2's
+own output already is (also with `-p > 1`), so step 1 writes it straight to BAM
+with `samtools view -b` — no sort, no `.bai` (such a BAM cannot be indexed, and
+Telescope reads it front to back). `samtools sort -n` gives identical counts
+but costs a full sort of a `-k 100` BAM; a **coordinate** sort scatters each
+read's alignments so nearly every record becomes its own fragment and
+multi-mappers are counted as unique. `telescope()` refuses a BAM whose header
+says `SO:coordinate`.
 
-Symptom: `total_fragments / nmap_idx` in `<sample>-run_stats.tsv` sits near
-1.0 instead of the expected 0.01–0.05.
+Cohorts quantified before this change (e.g. `telescope_TCC00573_redownloaded`,
+1503 samples) used coordinate-sorted BAMs. Their counts are biased and must not
+be mixed with counts from the current pipeline — redo steps 1 and 2 for the
+whole cohort.
+
+Health check — with correct grouping, `total_fragments` in
+`<sample>-run_stats.tsv` equals the read-pair count on the first line of
+`output/BOWTIE/<sample>/<sample>_bowties2.log`. A coordinate-sorted run shows
+several times more fragments than pairs.
 
 ```bash
-find output/TELESCOPE -maxdepth 2 -name '*-run_stats.tsv' -exec head -1 {} \; \
-| grep -oP '(?<=\t)nmap_idx:\K[0-9]+|(?<=\t)total_fragments:\K[0-9]+' | paste - - \
-| awk '$1>0{r=$2/$1; n++; s+=r} END{printf "n=%d mean=%.3f\n", n, s/n}'
+for f in output/TELESCOPE/*/*-run_stats.tsv; do
+  s=$(basename "$(dirname "$f")")
+  frag=$(head -1 "$f" | grep -oP '(?<=\t)total_fragments:\K[0-9]+')
+  pairs=$(head -1 "output/BOWTIE/$s/${s}_bowties2.log" 2>/dev/null | awk '{print $1}')
+  echo -e "$s\t$frag\t$pairs"
+done | awk -F'\t' '$3>0{r=$2/$3; n++; if(r>1.01||r<0.99)bad++} END{printf "n=%d off=%d\n", n, bad+0}'
 ```
-
-Note the `(?<=\t)` — without it the pattern also matches inside `nunmap_idx`
-and silently misaligns every pair.
-
-Fixing this means `samtools collate` or `sort -n` in step 1 and redoing step 2
-for the whole cohort. **Raise it with the user; do not switch sort order on
-your own** — mixing sort orders within a cohort makes samples incomparable,
-which is worse than a consistent known bias.
 
 ## Diagnosing a failed job
 
