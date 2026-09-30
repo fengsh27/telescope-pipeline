@@ -20,8 +20,19 @@
   "trimgalore_n_cores": 6,
   "sample_check_n_cores": 6,
 
+  "input_type":   "fastq",
   "fastq_suffix_1": "_1.fastq.gz",
   "fastq_suffix_2": "_2.fastq.gz",
+
+  "_comment_bam": "for BAM input set input_type to bam and point bam_table at a TSV (e.g. gdc-download files.tsv); samples_dir is then not needed",
+  "bam_table":      "",
+  "bam_sample_col": "id",
+  "bam_path_col":   "path",
+  "bam2fq_exclude_flags": "0xB00",
+
+  "strand_n_reads": 1000000,
+  "kallisto_index": "",
+  "done_marker":    "",
 
   "gtf":        "gencode.v39.annotation.gtf",
   "genome":     "GRCh38.p13.genome.chr.fa",

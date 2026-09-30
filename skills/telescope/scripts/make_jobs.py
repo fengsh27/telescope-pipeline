@@ -28,7 +28,7 @@ def subst(cfg, step, idx):
         "{{ACCOUNT}}": cfg["account"],
         "{{PARTITION}}": cfg["partition"],
         "{{PROJECT}}": cfg["project"],
-        "{{SAMPLES_DIR}}": cfg["samples_dir"],
+        "{{SAMPLES_DIR}}": cfg.get("samples_dir") or "",
         "{{CODE_DIR}}": cfg["code_dir"],
         "{{REF_DIR}}": cfg["ref_dir"],
         "{{INDEX_DIR}}": cfg["index_dir"],
@@ -51,6 +51,10 @@ def subst(cfg, step, idx):
         "{{S2_MEM}}": cfg["s2_mem"],
         "{{S2_TIME}}": cfg["s2_time"],
         "{{S2_CONCURRENT}}": str(cfg["s2_concurrent"]),
+        "{{STRAND_N_READS}}": str(cfg["strand_n_reads"]),
+        "{{KALLISTO_INDEX}}": cfg["kallisto_index"],
+        "{{BAM2FQ_EXCLUDE_FLAGS}}": str(cfg["bam2fq_exclude_flags"]),
+        "{{DONE_MARKER}}": cfg["done_marker"],
     }
 
 

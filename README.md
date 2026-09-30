@@ -2,12 +2,16 @@
 
 Quantifies HERV and LINE retrotransposon expression from paired-end RNA-seq
 with [Telescope](https://github.com/mlbendall/telescope), on the OSC Slurm
-cluster.
+cluster. Input is paired FASTQ or aligned BAM (e.g. GDC RNA-seq BAMs).
 
 ```
-FASTQ pairs ──► step 1: BOWTIE ─────────────────► tmp_<N>/<sample>.bam ──► step 2: TELESCOPE ──► <sample>-TE_counts.tsv
-                trim (Trim Galore)                                          telescope assign
-                strandedness (RSeQC)                                        (samples run concurrently)
+check_strandedness.py ──► stranded_mode per sample (qc/strandedness.tsv → manifest)
+                            BAM: RSeQC on its alignments · FASTQ: kallisto + RSeQC
+
+FASTQ pair ─┐
+            ├─► step 1: BOWTIE ───────────────────► tmp_<N>/<sample>.bam ──► step 2: TELESCOPE ──► <sample>-TE_counts.tsv
+BAM ────────┘   BAM → FASTQ (samtools, verified)     <sample>.stranded_mode    telescope assign --stranded_mode <mode>
+                trim (Trim Galore)                                           (samples run concurrently)
                 bowtie2 -k 100 | samtools view -b
 ```
 
@@ -20,7 +24,9 @@ is deleted only after every sample in that manifest has a counts file.
 | Path | Contents |
 |---|---|
 | `code/run.py` | Pipeline entry point, run inside each Slurm job |
-| `code/lib/worker_patch.py` | The pipeline itself (manifest-driven, starts from FASTQ) |
+| `code/lib/worker_patch.py` | The pipeline itself (manifest-driven, FASTQ or BAM rows) |
+| `code/lib/strandedness.py` | Strandedness measurement and the `--stranded_mode` call (shared by step 1 and `check_strandedness.py`) |
+| `code/lib/bam_input.py` | BAM → paired FASTQ.gz with read-count verification |
 | `code/lib/cmd.py` | Command-line arguments |
 | `code/lib/worker.py` | Original upstream version (GDC download path); not used |
 | `skills/telescope/` | Scripts, job templates and config for running a cohort — **use these** |
@@ -39,7 +45,7 @@ is deleted only after every sample in that manifest has a counts file.
 |---|---|
 | `Indexes/gencode.v39_bowtie2/human` | bowtie2 index — **the genome reads are aligned to** |
 | `REF/HG38_HERV_LINE_all_families_telescope_ann.gtf` | HERV/LINE annotation for Telescope (28,513 loci) |
-| `REF/gencode.v39.annotation.gtf`, `REF/gencode.v39.transcripts.fa` | Strandedness check |
+| `REF/gencode.v39.annotation.gtf`, `REF/gencode.v39.transcripts.fa` | Strandedness check (gene BED for RSeQC; kallisto index for FASTQ) |
 | `REF/GRCh38.p13.genome.chr.fa` | Passed as `--genome` but not read by the pipeline |
 
 The bowtie2 index contains only the 25 primary chromosomes of GRCh38.p13
@@ -60,8 +66,11 @@ them from the project directory.
 cp skills/telescope/config.example.json /fs/scratch/PDE0005/projects/MYPROJECT/telescope.config.json
 ```
 
-Set `project`, `samples_dir`, `code_dir`, `ref_dir`, `index_dir` and
-`job_prefix`. `code_dir` must point to an up-to-date copy of this repo's
+Set `project`, `code_dir`, `ref_dir`, `index_dir` and `job_prefix`, and the
+input: `samples_dir` for FASTQ, or `"input_type": "bam"` with `bam_table` (a
+TSV with `id` and `path` columns, e.g. a gdc-download `files.tsv`). Optional
+`done_marker` (e.g. `/path/results/{sample}.done`) is touched per sample when
+its counts exist. `code_dir` must point to an up-to-date copy of this repo's
 `code/` — each job copies `run.py` and `lib/` from there when it starts.
 
 **1. Check FASTQ integrity** (`gzip -t` on every file; results are cached):
@@ -71,22 +80,32 @@ python check_fastq.py --slurm --submit     # full cohort, as a job array
 python check_fastq.py -j 8                 # a few files, locally
 ```
 
-**2. Build manifests** (`manifests/manifest_<N>.tsv`, 4 samples each):
+**2. Decide each sample's `--stranded_mode`** (`qc/strandedness.tsv`):
 
 ```bash
-python make_manifests.py --require-qc
+python check_strandedness.py --slurm --submit     # then: --merge
+```
+
+Review the report (RF / FR / None / UNCLEAR, by sequencing center for BAMs).
+Hand overrides go in `qc/strandedness_overrides.tsv`.
+
+**3. Build manifests** (`manifests/manifest_<N>.tsv`, 4 samples each, with a
+`stranded_mode` column):
+
+```bash
+python make_manifests.py --require-qc --require-strand     # --require-qc: FASTQ only
 ```
 
 Manifest numbers are permanent. To add samples later use `--append`; never
 renumber a project that has submitted jobs.
 
-**3. Generate job scripts** (`jobs_step1/job_<N>.sh`, `jobs_step2/job_<N>.sh`):
+**4. Generate job scripts** (`jobs_step1/job_<N>.sh`, `jobs_step2/job_<N>.sh`):
 
 ```bash
 python make_jobs.py --step both
 ```
 
-**4. Submit**, naming the manifests explicitly:
+**5. Submit**, naming the manifests explicitly:
 
 ```bash
 python submit.py --step 1 --ids 0-9 --dry-run
@@ -119,6 +138,16 @@ equal the read-pair count on the first line of the bowtie2 log. The command is
 in `skills/telescope/SKILL.md`.
 
 ## Things that must not change
+
+- **Telescope always gets an explicit `--stranded_mode`.** Step 1 writes it
+  next to each BAM (`tmp_<N>/<sample>.stranded_mode`); step 2 refuses a sample
+  without one. Before this change every sample ran as `None` even though
+  step 1 measured strandedness (1459 of 1503 `telescope_TCC00573` samples
+  were RF), so older counts are unstranded counts — do not mix them with
+  stranded results.
+- **BAM → FASTQ keeps unmapped reads and drops secondary/supplementary
+  records**, and is verified by read counts; samtools exits 0 even when it
+  writes nothing.
 
 - **Do not sort the step-1 BAM by coordinate.** Telescope groups a read's
   alignments by taking consecutive records with the same name. bowtie2's raw

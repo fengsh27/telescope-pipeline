@@ -3,10 +3,20 @@
 """
 Patched worker.py (manifest-first workflow)
 -----------------------------------------
-This version supports running the Bowtie2 → Telescope pipeline starting
-**from paired-end FASTQs** listed in a simple manifest TSV with columns:
+This version supports running the Bowtie2 → Telescope pipeline starting from
+**paired-end FASTQs or aligned BAMs** listed in a manifest TSV with columns:
 
-    sample\tfq1\tfq2
+    sample\tfq1\tfq2\tbam\tstranded_mode
+
+A row uses either fq1+fq2 or bam. `bam` rows are converted to FASTQ inside
+step 1 (lib/bam_input.py). `stranded_mode` is Telescope's --stranded_mode
+(None, RF, FR, R, F); when it is blank, step 1 measures it (lib/strandedness.py:
+RSeQC on the BAM for BAM rows, kallisto on the FASTQ for FASTQ rows). Old
+three-column manifests (sample, fq1, fq2) still work: their mode is measured.
+
+Step 1 hands the mode to step 2 next to the BAM, as tmp_<N>/<sample>.stranded_mode,
+and step 2 passes it to `telescope assign --stranded_mode`. Step 2 refuses a
+sample without it rather than silently running Telescope's default (None).
 
 It keeps the original class shape (Worker) and depends on a CmdParser-like
 object that provides CLI-style attributes. Newly required attributes:
@@ -25,7 +35,9 @@ Major changes from the original:
 - Add `prepare_samples_info_manifest()` that reads the simple manifest.
 - Add `stage_import_fastq()` to lay out FASTQs under FASTQ/<sample>/
   as <sample>_R1.fq.gz and <sample>_R2.fq.gz (via symlink or copy).
-- Enable strandedness mapping for RF/FR so samples are not dropped.
+- Strandedness decides Telescope's --stranded_mode (it used to be measured
+  and then ignored, so every sample ran as None).
+- BAM input (converted to FASTQ in step 1).
 - Add `prepare_telescope_samples_info_from_scratch()` to discover BAMs
   produced by Bowtie2 in scratch for the Telescope stage.
 
@@ -50,6 +62,13 @@ import sys
 import time
 from typing import Dict, List, Any
 import traceback
+
+try:
+    from . import strandedness as strand_lib  # type: ignore
+    from .bam_input import bam_to_fastq  # type: ignore
+except ImportError:  # run as a loose module
+    import strandedness as strand_lib  # type: ignore
+    from bam_input import bam_to_fastq  # type: ignore
 
 try:
     # keep relative import if this file is part of a package
@@ -82,7 +101,6 @@ class PatchedWorker:
         self.herv_gtf_fpath: str = self.cmd_obj.herv_gtf
         self.telescope_n_cores: int = self.cmd_obj.telescope_n_cores
         self.workflows: List[str] = list(self.cmd_obj.workflows)
-        self.check_strand_n_workers: int = 2
         self.fastq_samples_limit: int = 6
         self.bam_samples_limit: int = max(1, getattr(self.cmd_obj, 'telescope_n_samples', 1))
 
@@ -90,63 +108,79 @@ class PatchedWorker:
         self.manifest_tsv: str = getattr(self.cmd_obj, 'manifest', '')
         self.samples_dir: str = getattr(self.cmd_obj, 'samples_dir', '')
 
-        # Keep bowtie strandedness mapping here if ever needed (not used below)
-        # self.bowtie2_strandedness = {...}
-
-        # Allow all three strandedness outcomes for Telescope
-        self.telescope_strandedness: Dict[str, str] = {
-            'unstranded': 'None', # We are only interested in unstranded samples
-            # 'RF/fr-firststrand': 'RF',
-            # 'FR/fr-secondstrand': 'FR',
-        }
+        # Strandedness -> telescope assign --stranded_mode
+        self.strand_n_reads: int = getattr(self.cmd_obj, 'strand_n_reads', 1000000)
+        self.kallisto_index: str = getattr(self.cmd_obj, 'kallisto_index', '') or 'kallisto_gencode.idx'
+        self.bam2fq_exclude_flags: str = getattr(self.cmd_obj, 'bam2fq_exclude_flags', '0xB00')
+        self.gene_bed_fpath: str = 'genes.protein_coding.bed12'   # derived from --gtf when needed
 
     # ------------------------------------------------------------------
     # Manifest + sample info helpers
     # ------------------------------------------------------------------
     def prepare_samples_info_manifest(self) -> Dict[str, Any]:
-        """Read the simple manifest (sample\tfq1\tfq2) and build info map.
-        FASTQ paths are resolved relative to `self.samples_dir` if not absolute.
+        """Read the manifest and build the per-sample info map.
+
+        Columns are matched by name (case-insensitive): sample, and either
+        fq1+fq2 or bam; stranded_mode is optional. Relative paths resolve
+        against `self.samples_dir`.
         """
         if not self.manifest_tsv:
-            raise ValueError("'manifest' argument is required for FASTQ mode")
+            raise ValueError("'manifest' argument is required for the BOWTIE workflow")
 
-        # Try reading as TSV; fall back to any whitespace in case
-        try:
-            df = pd.read_csv(self.manifest_tsv, sep='\t', dtype=str)
-        except Exception:
-            df = pd.read_csv(self.manifest_tsv, sep='\s+', engine='python', dtype=str)
+        df = pd.read_csv(self.manifest_tsv, sep='\t', dtype=str, keep_default_na=False)
+        df = df.rename(columns={c: c.strip().lower() for c in df.columns})
+        if 'sample' not in df.columns:
+            raise ValueError("Manifest %s has no 'sample' column" % self.manifest_tsv)
+        for c in ('fq1', 'fq2', 'bam', 'stranded_mode'):
+            if c not in df.columns:
+                df[c] = ''
 
-        required_cols = {'sample', 'fq1', 'fq2'}
-        if not required_cols.issubset(df.columns.str.lower()):
-            # try case-insensitive mapping
-            cols = {c.lower(): c for c in df.columns}
-            missing = required_cols - set(cols.keys())
-            if missing:
-                raise ValueError(f"Manifest missing columns: {missing}")
-            df = df.rename(columns={cols['sample']: 'sample', cols['fq1']: 'fq1', cols['fq2']: 'fq2'})
-        else:
-            # normalize exactly
-            df = df.rename(columns={c: c.lower() for c in df.columns})
+        def _abs(p):
+            p = str(p).strip()
+            if p and not os.path.isabs(p) and self.samples_dir:
+                p = os.path.join(self.samples_dir, p)
+            return p
 
         sample_info: Dict[str, Any] = {}
         for _, row in df.iterrows():
             s = str(row['sample']).strip()
-            fq1 = str(row['fq1']).strip()
-            fq2 = str(row['fq2']).strip()
-
-            if not os.path.isabs(fq1):
-                fq1 = os.path.join(self.samples_dir, fq1) if self.samples_dir else fq1
-            if not os.path.isabs(fq2):
-                fq2 = os.path.join(self.samples_dir, fq2) if self.samples_dir else fq2
-
+            if not s:
+                continue
+            fq1, fq2, bam = _abs(row['fq1']), _abs(row['fq2']), _abs(row['bam'])
+            mode = str(row['stranded_mode']).strip()
+            if bam and (fq1 or fq2):
+                raise ValueError("%s: give either bam or fq1/fq2, not both" % s)
+            if not bam and not (fq1 and fq2):
+                raise ValueError("%s: needs fq1 and fq2, or bam" % s)
+            if mode and mode not in strand_lib.TELESCOPE_MODES:
+                raise ValueError("%s: stranded_mode %r is not one of %s"
+                                 % (s, mode, ', '.join(strand_lib.TELESCOPE_MODES)))
             sample_info[s] = {
                 'sample_id': s,
-                'fq1': fq1,
-                'fq2': fq2,
+                'input_type': 'bam' if bam else 'fastq',
+                'fq1': fq1, 'fq2': fq2, 'bam': bam,
                 'cohort_id': '',
-                'telescope_strandedness': ''
+                'stranded_mode': mode,                        # '' -> measured in step 1
+                'stranded_mode_source': 'manifest' if mode else '',
             }
         return sample_info
+
+    def stage_import_bam(self, fastq_dpath: str, n_threads: int, sample_info: Dict[str, Any], sample: str) -> Dict[str, Any]:
+        """BAM -> FASTQ/<sample>/<sample>_R1.fq.gz / _R2.fq.gz (see lib/bam_input.py)."""
+        s_time = time.time()
+        bam = sample_info[sample]['bam']
+        try:
+            r = bam_to_fastq(bam, os.path.join(fastq_dpath, sample), sample,
+                             threads=n_threads, exclude_flags=self.bam2fq_exclude_flags)
+            d = {'status': 'Ok', 'note': '', 'sample_id': sample, 'R1_src': bam, 'R2_src': bam,
+                 'bam2fq_pairs': r['pairs'], 'bam2fq_singletons_dropped': r['singletons_dropped']}
+        except Exception as e:
+            d = {'status': 'Err', 'note': 'BAM->FASTQ: %s' % e, 'sample_id': sample,
+                 'R1_src': bam, 'R2_src': bam, 'bam2fq_pairs': 0, 'bam2fq_singletons_dropped': 0}
+        d['fastq_import_time_in_sec'] = round(time.time() - s_time, 2)
+        print('\t'.join(str(d[c]) for c in ('status', 'note', 'sample_id', 'bam2fq_pairs',
+                                              'bam2fq_singletons_dropped', 'fastq_import_time_in_sec')))
+        return d
 
     def stage_import_fastq(self, fastq_dpath: str, sample: str, fq1: str, fq2: str) -> Dict[str, Any]:
         """
@@ -302,48 +336,38 @@ class PatchedWorker:
         print('\t'.join([str(d[c]) for c in cols]))
         return d
 
-    def check_strandedness(self, sample_info: Dict[str, Any], fastq_dpath: str, gtf_fpath: str, transcript_fpath: str, sample: str) -> Dict[str, Any]:
-        """ Strandedness """
+    def resolve_strandedness(self, sample_info: Dict[str, Any], fastq_dpath: str, sample: str) -> Dict[str, Any]:
+        """Decide this sample's Telescope --stranded_mode.
+
+        The manifest value wins (check_strandedness.py measured it before the
+        job, or someone set it by hand). Otherwise measure it here: RSeQC on
+        the source BAM for BAM rows, kallisto on the staged (untrimmed) FASTQ
+        for FASTQ rows. UNCLEAR calls run as None.
+        """
         s_time = time.time()
-        cols = ['status', 'note', 'sample_id', 'cohort_id', 'strandedness', 'strandedness_time_in_sec']
-
-        o_dpath = os.path.join(fastq_dpath, sample)
-        strandedness = ''
-
-        cmd = (
-            "check_strandedness "
-            f"--gtf {gtf_fpath} "
-            f"--transcripts {transcript_fpath} "
-            "-n 1000000 "
-            f"--reads_1 {os.path.join(o_dpath, f'{sample}_R1.fq.gz')} "
-            f"--reads_2 {os.path.join(o_dpath, f'{sample}_R2.fq.gz')} "
-            f"--kallisto_index {sample}.kallisto_idx"
-        )
-        try:
-            log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
-            with open(os.path.join(o_dpath, f'{sample}_strandedness.log'), 'w') as f:
-                f.write(log.decode('utf-8'))
-                rows = log.decode('utf-8').strip().split('\n')
-                if rows:
-                    strandedness = rows[-1].strip().replace('Data is likely ', '')
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"command '{e.cmd}' return with error (code {e.returncode}): {e.output}")
-
-        # Cleanup kallisto artifacts
-        kallisto_idx = f'{sample}.kallisto_idx'
-        if os.path.isfile(kallisto_idx):
-            self.delete_file_or_dir(kallisto_idx)
-        stranded_test = f'stranded_test_{sample}_R1'
-        if os.path.isdir(stranded_test):
-            self.delete_file_or_dir(stranded_test)
-
-        d = {
-            'status': 'Ok', 'note': '', 'sample_id': sample,
-            'cohort_id': sample_info[sample].get('cohort_id', ''),
-            'strandedness': strandedness,
-            'strandedness_time_in_sec': round(time.time() - s_time, 2)
-        }
-        print('\t'.join([str(d[c]) for c in cols]))
+        info = sample_info[sample]
+        d = {'status': 'Ok', 'note': '', 'sample_id': sample,
+             'stranded_mode': info.get('stranded_mode', ''),
+             'stranded_mode_source': info.get('stranded_mode_source', ''),
+             'strand_call': '', 'strand_frac_rf': '', 'strand_frac_fr': '', 'strand_note': ''}
+        if not d['stranded_mode']:
+            try:
+                if info['input_type'] == 'bam':
+                    r = strand_lib.infer_bam(info['bam'], self.gene_bed_fpath, self.strand_n_reads)
+                else:
+                    o_dpath = os.path.join(fastq_dpath, sample)
+                    r = strand_lib.infer_fastq(
+                        self._detect_input(o_dpath, sample, 1), self._detect_input(o_dpath, sample, 2),
+                        self.gtf_fpath, self.transcript_fpath, self.kallisto_index, self.strand_n_reads)
+                d.update({'stranded_mode': r['telescope_mode'], 'stranded_mode_source': r['method'],
+                          'strand_call': r['stranded_mode'], 'strand_frac_rf': r['frac_rf'],
+                          'strand_frac_fr': r['frac_fr'], 'strand_note': r['note']})
+            except Exception as e:
+                d.update({'status': 'Err', 'note': 'strandedness: %s' % e})
+        info['stranded_mode'] = d['stranded_mode']
+        d['strandedness_time_in_sec'] = round(time.time() - s_time, 2)
+        print('\t'.join(str(d[c]) for c in ('status', 'note', 'sample_id', 'stranded_mode',
+                                              'stranded_mode_source', 'strand_note', 'strandedness_time_in_sec')))
         return d
 
     def telescope_input(self, sample_info: Dict[str, Any], fastq_dpath: str, output_dpath: str, n_cores: int, genome_fpath: str, scratch_dpath: str, sample: str) -> Dict[str, Any]:
@@ -457,7 +481,13 @@ class PatchedWorker:
     def telescope(self, sample_info: Dict[str, Any], output_dpath: str, n_cores: int, herv_gtf_fpath: str, sample: str) -> Dict[str, Any]:
         """ Run Telescope assign on a prepared BAM in the per-sample outdir. """
         s_time = time.time()
-        cols = ['status', 'note', 'sample_id', 'cohort_id', 'telescope', 'telescope_time_in_sec']
+        cols = ['status', 'note', 'sample_id', 'cohort_id', 'stranded_mode', 'telescope', 'telescope_time_in_sec']
+
+        # Never fall back to Telescope's default here: a sample whose mode was
+        # lost would be counted unstranded without anyone noticing.
+        mode = sample_info.get(sample, {}).get('stranded_mode', '')
+        if mode not in strand_lib.TELESCOPE_MODES:
+            raise RuntimeError("%s: no valid stranded_mode (%r); re-run step 1 for this sample" % (sample, mode))
 
         telescope_dpath = os.path.join(output_dpath, sample)
         tmp_dpath = os.path.join(telescope_dpath, 'tmp')
@@ -483,7 +513,8 @@ class PatchedWorker:
             f"--ncpu {n_cores} "
             f"--tempdir {tmp_dpath} "
             f"--outdir {telescope_dpath} "
-            f"--exp_tag {sample}"
+            f"--exp_tag {sample} "
+            f"--stranded_mode {mode}"
         )
         log = subprocess.check_output(cmd, stderr=subprocess.STDOUT, shell=True)
         with open(os.path.join(telescope_dpath, f'{sample}_telescope.log'), 'w') as f:
@@ -503,6 +534,7 @@ class PatchedWorker:
         d = {
             'status': 'Ok', 'note': '', 'sample_id': sample,
             'cohort_id': sample_info.get(sample, {}).get('cohort_id', ''),
+            'stranded_mode': mode,
             'telescope': 'Ok', 'telescope_time_in_sec': round(time.time() - s_time, 2)
         }
         print('\t'.join([str(d[c]) for c in cols]))
@@ -515,13 +547,32 @@ class PatchedWorker:
         return [samples[i:i + chunk_size] for i in range(0, len(samples), chunk_size)]
 
     def prepare_telescope_samples_info_from_scratch(self, scratch_path: str) -> Dict[str, Any]:
-        """Discover samples that have a BAM in scratch (output of Bowtie2 stage)."""
+        """Discover samples that have a BAM in scratch (output of Bowtie2 stage),
+        with the --stranded_mode step 1 wrote next to it ('' if missing)."""
         info: Dict[str, Any] = {}
         for bam in glob.glob(os.path.join(scratch_path, '*.bam')):
-            sample = os.path.basename(bam).replace('.bam', '')
+            sample = os.path.basename(bam)[:-len('.bam')]
             if os.path.isfile(bam):
-                info[sample] = {'sample_id': sample, 'cohort_id': ''}
+                info[sample] = {'sample_id': sample, 'cohort_id': '',
+                                'stranded_mode': self.read_stranded_mode(scratch_path, sample)}
         return info
+
+    @staticmethod
+    def stranded_mode_fpath(scratch_path: str, sample: str) -> str:
+        return os.path.join(scratch_path, f'{sample}.stranded_mode')
+
+    def write_stranded_mode(self, scratch_path: str, sample: str, mode: str) -> None:
+        fp = self.stranded_mode_fpath(scratch_path, sample)
+        with open(fp + '.tmp', 'w') as f:
+            f.write(mode + '\n')
+        os.replace(fp + '.tmp', fp)
+
+    def read_stranded_mode(self, scratch_path: str, sample: str) -> str:
+        try:
+            with open(self.stranded_mode_fpath(scratch_path, sample)) as f:
+                return f.read().strip()
+        except OSError:
+            return ''
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -547,7 +598,7 @@ class PatchedWorker:
         logs_map: Dict[str, Any] = {}
 
         # =====================================================================
-        # BOWTIE (FASTQ → trim → strandedness → Bowtie2 → BAM in scratch)
+        # BOWTIE (BAM→FASTQ | FASTQ → strandedness → trim → Bowtie2 → BAM in scratch)
         # =====================================================================
         if 'BOWTIE' in self.workflows:
             sample_info = self.prepare_samples_info_manifest()
@@ -558,19 +609,57 @@ class PatchedWorker:
             self.create_dir(fastq_dpath)
 
             # -----------------------------------------------------------------
-            # Import/link FASTQs into expected layout
+            # Stage inputs as FASTQ/<sample>/<sample>_R{1,2}.fq.gz:
+            # FASTQ rows are symlinked, BAM rows are converted (and verified).
             # -----------------------------------------------------------------
-            sample_to_process: List[str] = []
+            s_time = time.time()
             for sample, info in sample_info.items():
+                logs_map[sample] = {'status': 'Ok', 'note': '', 'sample_id': sample,
+                                    'cohort_id': info.get('cohort_id', ''), 'input_type': info['input_type']}
+            fq_samples = [s for s, i in sample_info.items() if i['input_type'] == 'fastq']
+            bam_samples = [s for s, i in sample_info.items() if i['input_type'] == 'bam']
+            for sample in fq_samples:
+                info = sample_info[sample]
                 result = self.stage_import_fastq(fastq_dpath, sample, info['fq1'], info['fq2'])
-                logs_map[sample] = {
-                    'status': result['status'],
-                    'note': result['note'],
-                    'sample_id': sample,
-                    'cohort_id': info.get('cohort_id', ''),
-                }
-                if result['status'] == 'Ok':
-                    sample_to_process.append(sample)
+                logs_map[sample].update(result)
+            if bam_samples:
+                n_workers = max(1, min(len(bam_samples), self.n_cores // 6))
+                func = partial(self.stage_import_bam, fastq_dpath, max(2, self.n_cores // n_workers), sample_info)
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    for result in executor.map(func, bam_samples, chunksize=1):
+                        logs_map[result['sample_id']].update(result)
+            print("Input staging (wall-time): " f"{round(time.time() - s_time, 2)} (s)")
+            sample_to_process: List[str] = [s for s in sample_info if logs_map[s]['status'] == 'Ok']
+
+            if not sample_to_process:
+                self.save_logs(logs_map, o_path)
+                return
+
+            # -----------------------------------------------------------------
+            # Strandedness -> telescope --stranded_mode. Taken from the manifest
+            # when set; otherwise measured here. A sample whose mode cannot be
+            # decided is dropped: Telescope must not guess.
+            # -----------------------------------------------------------------
+            s_time = time.time()
+            need = [s for s in sample_to_process if not sample_info[s]['stranded_mode']]
+            try:
+                if any(sample_info[s]['input_type'] == 'bam' for s in need):
+                    strand_lib.bed_from_gtf(self.gtf_fpath, self.gene_bed_fpath)
+                if any(sample_info[s]['input_type'] == 'fastq' for s in need):
+                    # build once, before the parallel calls, not once per sample
+                    strand_lib.ensure_kallisto_index(self.transcript_fpath, self.kallisto_index)
+            except Exception as e:
+                traceback.print_exc()
+                for s in need:
+                    logs_map[s].update({'status': 'Err', 'note': 'strandedness setup: %s' % e})
+            func = partial(self.resolve_strandedness, sample_info, fastq_dpath)
+            todo = [s for s in sample_to_process if logs_map[s]['status'] == 'Ok']
+            with ProcessPoolExecutor(max_workers=max(1, min(4, len(todo)))) as executor:
+                for result in executor.map(func, todo, chunksize=1):
+                    logs_map[result['sample_id']].update(result)
+                    sample_info[result['sample_id']]['stranded_mode'] = result['stranded_mode']
+            print("Strandedness (wall-time): " f"{round(time.time() - s_time, 2)} (s)")
+            sample_to_process = [s for s in sample_to_process if logs_map[s]['status'] == 'Ok']
 
             if not sample_to_process:
                 self.save_logs(logs_map, o_path)
@@ -589,31 +678,13 @@ class PatchedWorker:
                         d = {**logs_map[result['sample_id']], **result}
                         logs_map[result['sample_id']] = d
                 print("FastQ samples trimming (wall-time): " f"{round(time.time() - s_time, 2)} (s)")
-                sample_to_process2 = [v['sample_id'] for _, v in logs_map.items() if v['status'] == 'Ok']
+                sample_to_process2 = [s for s in sample_to_process if logs_map[s]['status'] == 'Ok']
             except Exception:
                 traceback.print_exc()
 
             if not sample_to_process2:
                 self.save_logs(logs_map, o_path)
                 return
-
-            # -----------------------------------------------------------------
-            # Strandedness (optional info; we do not drop samples if not matched)
-            # -----------------------------------------------------------------
-            try:
-                func = partial(self.check_strandedness, sample_info, fastq_dpath, self.gtf_fpath, self.transcript_fpath)
-                s_time = time.time()
-                with ProcessPoolExecutor(max_workers=self.check_strand_n_workers) as executor:
-                    for result in executor.map(func, sample_to_process2, chunksize=1):
-                        d = {**logs_map[result['sample_id']], **result}
-                        logs_map[result['sample_id']] = d
-                        # record strandedness mapping if recognized
-                        str_mode = result.get('strandedness', '')
-                        if str_mode in self.telescope_strandedness:
-                            sample_info[result['sample_id']]['telescope_strandedness'] = self.telescope_strandedness[str_mode]
-                print("Samples strandedness check (wall-time): " f"{round(time.time() - s_time, 2)} (s)")
-            except Exception:
-                traceback.print_exc()
 
             # -----------------------------------------------------------------
             # Bowtie2 → BAM in scratch
@@ -632,6 +703,9 @@ class PatchedWorker:
                     )
                     d = {**logs_map[result['sample_id']], **result}
                     logs_map[result['sample_id']] = d
+                    if result['status'] == 'Ok':
+                        # handoff to step 2, next to the BAM it belongs to
+                        self.write_stranded_mode(scratch_path, sample, sample_info[sample]['stranded_mode'])
                 print("Bowtie2 processing (wall-time): " f"{round(time.time() - s_time, 2)} (s)")
             except Exception:
                 traceback.print_exc()
@@ -646,6 +720,14 @@ class PatchedWorker:
 
             for sample, info in sample_info_tele.items():
                 bam_fpath = os.path.join(scratch_path, f'{sample}.bam')
+                if info['stranded_mode'] not in strand_lib.TELESCOPE_MODES:
+                    logs_map[sample] = {
+                        'status': 'Err', 'sample_id': sample, 'cohort_id': info.get('cohort_id', ''),
+                        'stranded_mode': info['stranded_mode'],
+                        'note': 'no valid %s next to the BAM; re-run step 1 for this sample'
+                                % os.path.basename(self.stranded_mode_fpath(scratch_path, sample))}
+                    print('\t'.join(['Err', logs_map[sample]['note'], sample]))
+                    continue
                 if os.path.isfile(bam_fpath):
                     tele_dpath = os.path.join(o_path, 'TELESCOPE', sample)
                     if os.path.isdir(tele_dpath):

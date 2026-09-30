@@ -18,7 +18,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (add_config_arg, load_config, parse_ids, manifest_path,  # noqa: E402
-                     read_manifest, job_name, queued_job_names, human)
+                     read_manifest_rows, sample_inputs, job_name, queued_job_names, human,
+                     STRANDED_MODES)
 
 DIRECTIVES = ("partition", "time", "cpus-per-task", "mem", "account")
 
@@ -89,22 +90,36 @@ def preflight(cfg, step, ids, queued):
             problems[i] = probs
             continue
 
-        rows = read_manifest(mpath)
+        rows = read_manifest_rows(mpath)
         if not rows:
             probs.append("manifest is empty")
 
         nbytes = 0
         if step == 1:
-            for s, f1, f2 in rows:
-                for p in (f1, f2):
-                    if not p or not os.path.isfile(p) or os.path.getsize(p) == 0:
-                        probs.append(f"missing FASTQ for {s}: {p or '(no path)'}")
+            unmoded = 0
+            for r in rows:
+                s = r["sample"]
+                if r["bam"] and (r["fq1"] or r["fq2"]):
+                    probs.append(f"{s}: row has both bam and fq1/fq2")
+                paths = sample_inputs(r)
+                if not paths or (not r["bam"] and len(paths) < 2):
+                    probs.append(f"{s}: needs fq1+fq2 or bam")
+                for p in paths:
+                    if not os.path.isfile(p) or os.path.getsize(p) == 0:
+                        probs.append(f"missing {'BAM' if r['bam'] else 'FASTQ'} for {s}: {p}")
                     else:
                         nbytes += os.path.getsize(p)
+                if r["stranded_mode"] and r["stranded_mode"] not in STRANDED_MODES:
+                    probs.append(f"{s}: stranded_mode {r['stranded_mode']!r} is not one of {', '.join(STRANDED_MODES)}")
+                elif not r["stranded_mode"]:
+                    unmoded += 1
+            if unmoded:
+                info[i] = f"{unmoded} sample(s) without stranded_mode (measured in the job)"
         else:
             tmp = os.path.join(cfg["project"], f"tmp_{i}")
             done = 0
-            for s, _, _ in rows:
+            for r in rows:
+                s = r["sample"]
                 bam = os.path.join(tmp, f"{s}.bam")
                 counts = os.path.join(cfg["project"], "output", "TELESCOPE",
                                       s, f"{s}-TE_counts.tsv")
@@ -115,6 +130,14 @@ def preflight(cfg, step, ids, queued):
                     probs.append(f"missing BAM for {s}: {bam}")
                 else:
                     nbytes += os.path.getsize(bam)
+                    try:
+                        with open(os.path.join(tmp, f"{s}.stranded_mode")) as f:
+                            mode = f.read().strip()
+                    except OSError:
+                        mode = ""
+                    if mode not in STRANDED_MODES:
+                        probs.append(f"{s}: no valid {s}.stranded_mode next to its BAM "
+                                     f"(step 1 predates the stranded-mode change? re-run step 1)")
             if done == len(rows):
                 probs.append(f"all {done} sample(s) already have counts - nothing to do")
             elif done:

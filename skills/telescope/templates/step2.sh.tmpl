@@ -70,10 +70,20 @@ if [ -d output/TELESCOPE ]; then
 fi
 
 # Only reclaim the BAMs once every sample in this manifest produced a counts file.
+# Optionally mark each finished sample (e.g. for gdc-download cleanup): the
+# config's done_marker with {sample} replaced, touched only when counts exist.
+DONE_MARKER="{{DONE_MARKER}}"
 missing=0
 while IFS=$'\t' read -r s _; do
   [ "$s" = "sample" ] && continue
-  [ -s "${PROJECT_PATH}/output/TELESCOPE/${s}/${s}-TE_counts.tsv" ] || { echo "MISSING counts: $s"; missing=1; }
+  if [ -s "${PROJECT_PATH}/output/TELESCOPE/${s}/${s}-TE_counts.tsv" ]; then
+    if [ -n "$DONE_MARKER" ]; then
+      m="${DONE_MARKER//\{sample\}/$s}"
+      mkdir -p "$(dirname "$m")" && touch "$m"
+    fi
+  else
+    echo "MISSING counts: $s"; missing=1
+  fi
 done < "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv"
 
 if [ "$missing" -eq 0 ] && [ "$rc" -eq 0 ]; then

@@ -24,8 +24,9 @@ SAMPLES_PATH="{{SAMPLES_DIR}}"
 # tmp_{{ID}} holds the BAMs handed to step 2; it must survive this job.
 mkdir -p "${PROJECT_PATH}/tmp_{{ID}}"
 
-# Everything heavy (staged FASTQ, trimmed FASTQ) lives on the job-private
-# pfsdir and is discarded at job end. Only the BAM is moved to tmp_{{ID}}.
+# Everything heavy (FASTQ converted from BAM rows, staged and trimmed FASTQ)
+# lives on the job-private pfsdir and is discarded at job end. Only the BAM and
+# its <sample>.stranded_mode are moved to tmp_{{ID}}.
 cp -R "{{CODE_DIR}}/lib" "{{CODE_DIR}}/run.py" \
       "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv" "${PFSDIR}/"
 cd "${PFSDIR}"
@@ -47,6 +48,9 @@ python run.py \
   --seed {{SEED}} \
   --scratch_dir "${PROJECT_PATH}/tmp_{{ID}}" \
   --fastq_mode \
+  --strand_n_reads {{STRAND_N_READS}} \
+  --kallisto_index "{{KALLISTO_INDEX}}" \
+  --bam2fq_exclude_flags {{BAM2FQ_EXCLUDE_FLAGS}} \
   --sample_check_n_cores {{SAMPLE_CHECK_N_CORES}} && rc=0 || rc=$?
 
 # Copy the bowtie2 logs back even if run.py died. The BAMs are written straight
@@ -63,12 +67,13 @@ fi
 echo "=== BAMs handed to step 2 ==="
 ls -l "${PROJECT_PATH}/tmp_{{ID}}/" || true
 
-# Report which samples did not produce a BAM, then surface the failure to Slurm
-# only after everything has been copied back.
+# Report which samples did not produce a BAM (or its stranded_mode), then
+# surface the failure to Slurm only after everything has been copied back.
 missing=0
 while IFS=$'\t' read -r s _; do
   [ "$s" = "sample" ] && continue
   [ -s "${PROJECT_PATH}/tmp_{{ID}}/${s}.bam" ] || { echo "MISSING bam: $s"; missing=1; }
+  [ -s "${PROJECT_PATH}/tmp_{{ID}}/${s}.stranded_mode" ] || { echo "MISSING stranded_mode: $s"; missing=1; }
 done < "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv"
 
 if [ "$missing" -ne 0 ] || [ "$rc" -ne 0 ]; then
