@@ -162,7 +162,7 @@ def main():
     for step in steps:
         for i in written[step]:
             fp = os.path.join(cfg["project"], f"jobs_step{step}", f"job_{i}.sh")
-            r = subprocess.run(["bash", "-n", fp], capture_output=True, text=True)
+            r = subprocess.run(["bash", "-n", fp], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if r.returncode != 0:
                 bad.append((fp, r.stderr.strip()))
     if bad:

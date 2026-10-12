@@ -213,6 +213,14 @@ class CmdParser():
         )
 
         cmd_args.add_argument(
+            '--final_dir',
+            type=str,
+            default='',
+            required=False,
+            help='TELESCOPE: copy each sample here as soon as it finishes (project output/TELESCOPE)'
+        )
+
+        cmd_args.add_argument(
             '--bam2fq_exclude_flags',
             type=str,
             default='0xB00',
@@ -253,6 +261,7 @@ class CmdParser():
         self.strand_n_reads: int = args.strand_n_reads
         self.kallisto_index: str = args.kallisto_index
         self.bam2fq_exclude_flags: str = args.bam2fq_exclude_flags
+        self.final_dir: str = args.final_dir.rstrip('/')
 
         if not self.fastq_mode and not os.path.isfile(self.gdc_cl):
             self.print_error_and_abort('ERROR. No GDC client found')

@@ -80,7 +80,7 @@ def check_one(path):
     if st.st_size == 0:
         return (path, 0, int(st.st_mtime), "BAD", "empty file")
     try:
-        p = subprocess.run(["gzip", "-t", path], capture_output=True, text=True)
+        p = subprocess.run(["gzip", "-t", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     except OSError as e:
         return (path, st.st_size, int(st.st_mtime), "ERROR", f"could not run gzip: {e}")
     if p.returncode == 0:
@@ -241,7 +241,7 @@ def main():
         if not args.submit:
             print("not submitted (pass --submit to sbatch it)")
             return 0
-        r = subprocess.run(["sbatch", script], capture_output=True, text=True)
+        r = subprocess.run(["sbatch", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         if r.returncode != 0:

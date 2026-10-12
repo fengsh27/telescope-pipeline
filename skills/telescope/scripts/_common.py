@@ -32,6 +32,19 @@ DEFAULTS = {
     "strand_n_reads": 1000000,
     "kallisto_index": "",          # default <project>/qc/kallisto_gencode.idx
     "done_marker": "",             # e.g. /x/results/{sample}.done, touched by step 2
+    # submit.py: run sbatch as this Unix group ('' = the account). A job's
+    # $PFSDIR is created under /fs/scratch/<job's group>/, not the account.
+    "submit_group": "",
+    # submit.py --step 2 sizes --mem/--cpus per manifest from bowtie2 read pairs:
+    # per-sample peak ~ base + per_mpairs * M pairs; the job needs the sum over
+    # the samples that run at once, times margin. Calibrate from the
+    # telescope_max_rss_gb column of output/TELESCOPE/logs_<N>.tsv.
+    "s2_auto_size": True,
+    "s2_mem_base_gb": 4.0,
+    "s2_mem_gb_per_mpairs": 0.25,
+    "s2_mem_margin": 1.2,
+    "max_mem_per_cpu_mb": 4027,    # nextgen MaxMemPerCPU
+    "max_cpus_per_job": 120,       # nextgen MaxCPUsPerNode
     "gtf": "gencode.v39.annotation.gtf",
     "genome": "GRCh38.p13.genome.chr.fa",
     "transcript": "gencode.v39.transcripts.fa",
@@ -180,7 +193,7 @@ def queued_job_names(user=None):
     cmd = ["squeue", "-h", "-o", "%j"]
     cmd += ["-u", user or os.environ.get("USER", "")]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return set()
     if out.returncode != 0:

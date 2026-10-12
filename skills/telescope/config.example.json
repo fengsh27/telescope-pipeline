@@ -34,6 +34,17 @@
   "kallisto_index": "",
   "done_marker":    "",
 
+  "_comment_submit": "submit.py runs sbatch as submit_group (default: account) so each job's $PFSDIR lands in that group's scratch",
+  "submit_group":   "",
+
+  "_comment_s2": "step 2 --mem/--cpus are sized per manifest from bowtie2 read pairs; calibrate from telescope_max_rss_gb in output/TELESCOPE/logs_<N>.tsv",
+  "s2_auto_size":         true,
+  "s2_mem_base_gb":       4.0,
+  "s2_mem_gb_per_mpairs": 0.25,
+  "s2_mem_margin":        1.2,
+  "max_mem_per_cpu_mb":   4027,
+  "max_cpus_per_job":     120,
+
   "gtf":        "gencode.v39.annotation.gtf",
   "genome":     "GRCh38.p13.genome.chr.fa",
   "transcript": "gencode.v39.transcripts.fa",

@@ -11,8 +11,11 @@ rest anyway wastes an allocation. Pass --allow-partial to submit what is ready.
 """
 
 import argparse
+import grp
+import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -70,6 +73,88 @@ def check_environment(cfg, step):
     return fatal, warn
 
 
+def bowtie2_pairs(cfg, sample):
+    """Read pairs bowtie2 aligned for a sample (first line of its step-1 log), or None."""
+    fp = os.path.join(cfg["project"], "output", "BOWTIE", sample, f"{sample}_bowties2.log")
+    try:
+        with open(fp) as f:
+            return int(f.readline().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def counts_done(cfg, sample):
+    c = os.path.join(cfg["project"], "output", "TELESCOPE", sample, f"{sample}-TE_counts.tsv")
+    return os.path.isfile(c) and os.path.getsize(c) > 0
+
+
+def plan_step2(cfg, rows):
+    """--mem / --cpus-per-task / concurrency for one step-2 job, from its samples.
+
+    Each remaining sample's peak is estimated as base + per_mpairs * M pairs.
+    The samples run s2_concurrent at a time, so the job must hold the sum of
+    the largest that can coincide. Memory on nextgen comes with cpus
+    (max_mem_per_cpu_mb each), so cpus follow memory; if even max_cpus_per_job
+    is too little, fewer samples run at once.
+    -> (plan dict, problem or None)
+    """
+    todo = [r["sample"] for r in rows if not counts_done(cfg, r["sample"])]
+    pairs = {s: bowtie2_pairs(cfg, s) for s in todo}
+    missing = [s for s, p in pairs.items() if p is None]
+    if missing:
+        return None, (f"no bowtie2 read count for {', '.join(missing[:3])} "
+                      f"(output/BOWTIE/<s>/<s>_bowties2.log) -- cannot size step 2")
+    est = sorted(((float(cfg["s2_mem_base_gb"]) + float(cfg["s2_mem_gb_per_mpairs"]) * p / 1e6, s)
+                  for s, p in pairs.items()), reverse=True)
+    per_cpu = int(cfg["max_mem_per_cpu_mb"])
+    cap_mb = int(cfg["max_cpus_per_job"]) * per_cpu
+    floor_mb = mem_mb(cfg["s2_mem"])
+    k = max(1, min(int(cfg["s2_concurrent"]), len(est)))
+    while True:
+        need_mb = int(math.ceil(sum(g for g, _ in est[:k]) * float(cfg["s2_mem_margin"]) * 1024))
+        if need_mb <= cap_mb or k == 1:
+            break
+        k -= 1
+    if need_mb > cap_mb:
+        return None, (f"{est[0][1]} alone needs ~{need_mb / 1024:.0f}G, more than "
+                      f"{cfg['max_cpus_per_job']} cpus x {per_cpu} MB")
+    want_mb = max(need_mb, floor_mb)
+    cpus = max(int(cfg["s2_cpus"]), int(math.ceil(want_mb / per_cpu)))
+    want_mb = cpus * per_cpu             # use all the memory the cpus pay for
+    return {"samples": len(est), "concurrency": k, "cpus": cpus, "mem_mb": want_mb,
+            "need_gb": round(need_mb / 1024, 1),
+            "largest": "%s %.0fM pairs" % (est[0][1][:8], pairs[est[0][1]] / 1e6) if est else "",
+            "est_gb": ";".join("%s:%.1f" % (s, g) for g, s in est)}, None
+
+
+def mem_mb(spec):
+    m = re.match(r"^(\d+)([GgMm]?)$", str(spec))
+    if not m:
+        return 0
+    return int(m.group(1)) * (1024 if m.group(2) in ("G", "g", "") else 1)
+
+
+def sbatch_command(cfg, script, extra=()):
+    """sbatch, run as cfg submit_group (default: the account) via sg.
+
+    A job's $PFSDIR is created under /fs/scratch/<job's Unix group>/ -- by
+    default the user's *primary* group, whatever --account says. Submitting
+    through `sg <group>` makes the job's group, and so its scratch, match.
+    """
+    cmd = ["sbatch"] + list(extra) + [script]
+    group = cfg.get("submit_group") or cfg["account"]
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        sys.exit(f"submit_group {group!r} is not a Unix group on this system "
+                 f"(set submit_group in the config)")
+    if gid == os.getgid():
+        return cmd                        # already the job's group
+    if gid not in os.getgroups():
+        sys.exit(f"you are not a member of group {group!r}; set submit_group in the config")
+    return ["sg", group, "-c", " ".join(shlex.quote(c) for c in cmd)]
+
+
 def preflight(cfg, step, ids, queued):
     """-> (ready_ids, {id: [problems]}, info)"""
     ready, problems, info = [], {}, {}
@@ -81,7 +166,7 @@ def preflight(cfg, step, ids, queued):
         if not os.path.isfile(script):
             probs.append(f"job script missing: {script}")
         else:
-            r = subprocess.run(["bash", "-n", script], capture_output=True, text=True)
+            r = subprocess.run(["bash", "-n", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if r.returncode != 0:
                 probs.append(f"bash -n failed: {r.stderr.strip()[:200]}")
 
@@ -166,6 +251,8 @@ def main():
     ap.add_argument("--allow-partial", action="store_true",
                     help="submit the manifests that pass instead of aborting")
     ap.add_argument("--max", type=int, help="cap the number submitted")
+    ap.add_argument("--no-auto-size", action="store_true",
+                    help="step 2: use the script's --mem/--cpus instead of sizing from read counts")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -227,6 +314,30 @@ def main():
         print(f"\n--max {args.max}: submitting the first {args.max} of {len(ready)}")
         ready = ready[:args.max]
 
+    plans = {}
+    if step == 2 and cfg["s2_auto_size"] and not args.no_auto_size:
+        print("\nstep-2 resources sized per manifest (est. peak = %.1f GB + %.2f GB per M pairs, x%.2f):"
+              % (float(cfg["s2_mem_base_gb"]), float(cfg["s2_mem_gb_per_mpairs"]), float(cfg["s2_mem_margin"])))
+        print("  %-9s %7s %5s %10s %6s %8s  %s" % ("manifest", "samples", "conc", "need", "cpus", "mem", "largest"))
+        unsized = []
+        for i in ready:
+            plan, why = plan_step2(cfg, read_manifest_rows(manifest_path(cfg, i)))
+            if why:
+                unsized.append(i)
+                print(f"  manifest_{i}: {why}", file=sys.stderr)
+                continue
+            plans[i] = plan
+            print("  %-9s %7d %5d %9.1fG %6d %7.0fG  %s" % (
+                f"_{i}", plan["samples"], plan["concurrency"], plan["need_gb"], plan["cpus"],
+                plan["mem_mb"] / 1024, plan["largest"]))
+        if unsized:
+            print("\nnothing submitted: some manifests cannot be sized (or pass --no-auto-size).",
+                  file=sys.stderr)
+            return 1
+
+    group = cfg.get("submit_group") or cfg["account"]
+    print(f"\nsubmitting as group {group} (its scratch holds the jobs' $PFSDIR)")
+
     if args.dry_run:
         print(f"\n--dry-run: would submit {len(ready)} job(s): "
               f"{ready[:10]}{'...' if len(ready) > 10 else ''}")
@@ -235,11 +346,19 @@ def main():
     ok, bad, jids = 0, 0, []
     for i in ready:
         script = os.path.join(cfg["project"], f"jobs_step{step}", f"job_{i}.sh")
-        r = subprocess.run(["sbatch", script], capture_output=True, text=True)
+        extra = []
+        if i in plans:
+            p = plans[i]
+            extra = [f"--cpus-per-task={p['cpus']}", f"--mem={p['mem_mb']}M",
+                     f"--export=ALL,S2_CONCURRENT_OVERRIDE={p['concurrency']}"]
+        r = subprocess.run(sbatch_command(cfg, script, extra),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         m = re.search(r"Submitted batch job (\d+)", r.stdout or "")
         if r.returncode == 0 and m:
             ok += 1
             jids.append(int(m.group(1)))
+            if i in plans:
+                record_plan(cfg, i, m.group(1), plans[i])
         else:
             bad += 1
             print(f"FAILED manifest_{i}: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
@@ -258,6 +377,19 @@ def main():
               "-o JobID,JobName%18,State,Elapsed,ExitCode -S $(date +%F) -E now\n"
               f"  squeue -u $USER -h -o '%T' | sort | uniq -c")
     return 0 if bad == 0 else 1
+
+
+def record_plan(cfg, idx, jobid, plan):
+    """Append what was asked for, so estimates can be checked against MaxRSS later."""
+    fp = os.path.join(cfg["project"], "logs", "step2_resources.tsv")
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    cols = ["manifest", "job", "samples", "concurrency", "need_gb", "cpus", "mem_mb", "est_gb"]
+    new = not os.path.exists(fp)
+    with open(fp, "a") as f:
+        if new:
+            f.write("\t".join(cols) + "\n")
+        row = dict(plan, manifest=idx, job=jobid)
+        f.write("\t".join(str(row[c]) for c in cols) + "\n")
 
 
 if __name__ == "__main__":

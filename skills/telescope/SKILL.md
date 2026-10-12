@@ -48,6 +48,20 @@ scripts agree with each other and with whatever ran last month.
 cp skills/telescope/config.example.json telescope.config.json
 ```
 
+**Snapshot the code into the project** and point `code_dir` at the copy, not
+at this checkout. Jobs read `code_dir` when they start, so a branch switch or
+pull while jobs are queued silently changes what they run:
+
+```bash
+cp -r code <project>/code && git rev-parse --short HEAD > <project>/code/SNAPSHOT_OF
+```
+
+**Python.** Every script runs under the env's Python 3.6 and the system 3.9.
+`check_strandedness.py` needs the env active for its tools (samtools, RSeQC,
+kallisto). When editing, stay 3.6-compatible: no `capture_output=`/`text=`
+in `subprocess.run` (use `stdout=PIPE, stderr=PIPE, universal_newlines=True`),
+no walrus operator, no `dict | dict`.
+
 ## 1. Validate the FASTQ files
 
 ```bash
@@ -77,8 +91,9 @@ otherwise.
 ## 2. Decide each sample's Telescope `--stranded_mode`
 
 ```bash
-python skills/telescope/scripts/check_strandedness.py --slurm --submit   # cohort, as an array
-python skills/telescope/scripts/check_strandedness.py -j 4               # a few samples, here (conda env active)
+conda activate immuno_telescope
+python skills/telescope/scripts/check_strandedness.py -j 8               # BAMs: ~20 s each, fine here for a batch
+python skills/telescope/scripts/check_strandedness.py --slurm --submit   # large FASTQ cohorts, as an array
 python skills/telescope/scripts/check_strandedness.py --merge            # after the array finishes
 ```
 
@@ -180,10 +195,44 @@ Preflight runs first and aborts the whole batch if anything fails:
 | resource directives uniform across the batch | ✓ | ✓ |
 
 Useful flags: `--dry-run` (preflight only), `--allow-partial` (submit the
-manifests that pass instead of aborting), `--max N` (cap the batch).
+manifests that pass instead of aborting), `--max N` (cap the batch),
+`--no-auto-size` (step 2: keep the script's `--mem`/`--cpus`).
+
+**Jobs are submitted as Unix group `submit_group`** (default: `account`), via
+`sg <group> -c "sbatch ..."`. A job's `$PFSDIR` — where step 1 stages 75–230 GB
+of FASTQ and step 2 copies its BAMs — is created under
+`/fs/scratch/<job's group>/`, which is the user's *primary* group (here
+`PCON0100`) unless the group is set, whatever `--account` says.
+
+**Step 2 is sized per manifest.** Telescope's peak memory grows with sample
+size (pilot: ~68 GB alone for a 285 M-pair sample; four ~80 M-pair samples fit
+in 47 G). `submit.py --step 2` reads each remaining sample's read pairs from
+`output/BOWTIE/<s>/<s>_bowties2.log`, estimates its peak as
+`s2_mem_base_gb + s2_mem_gb_per_mpairs × M pairs`, and requests the sum over the
+samples that run at once × `s2_mem_margin` — as cpus × `max_mem_per_cpu_mb`,
+because nextgen sells memory only with cpus. If even `max_cpus_per_job` is too
+little it lowers concurrency (`S2_CONCURRENT_OVERRIDE`). The plan is printed in
+`--dry-run` and recorded in `logs/step2_resources.tsv`. Step 2 therefore cannot
+be pre-queued with `afterok`: submit it once step 1 has finished.
+
+The default coefficients are deliberately generous (two pilot data points).
+Each sample's real peak is now logged as `telescope_max_rss_gb` (from
+`/usr/bin/time -v`) in `output/TELESCOPE/logs_<N>.tsv` and
+`<sample>_telescope_summary.tsv`; refit the two coefficients from those after
+the first few dozen manifests.
 
 On success it prints `submitted=N failed=0 range=<first>..<last>`. Record that
 range — it is how the jobs are found later with `sacct`.
+
+**Submit step 2 after step 1 has finished**, with `submit.py --step 2 --ids …`;
+its sizing needs step 1's read counts. Keep a small table of manifest →
+step-1 job → step-2 job in the project; job ids are how cost and failures are
+traced later.
+
+**A killed step-2 job keeps its finished samples.** Each sample is copied to
+`output/TELESCOPE/<sample>/` (via `<sample>.partial`, then renamed) the moment
+it finishes, and a re-submitted step 2 skips samples whose counts are already
+there. Resubmitting after a failure therefore only redoes what was lost.
 
 ## Cluster facts that are easy to get wrong
 
@@ -251,6 +300,11 @@ for f in output/TELESCOPE/*/*-run_stats.tsv; do
   echo -e "$s\t$frag\t$pairs"
 done | awk -F'\t' '$3>0{r=$2/$3; n++; if(r>1.01||r<0.99)bad++} END{printf "n=%d off=%d\n", n, bad+0}'
 ```
+
+## Known issues
+
+- Pandas reads the stranded mode `None` in `logs_<N>.tsv` as NaN; pass
+  `keep_default_na=False` when reading the logs.
 
 ## Diagnosing a failed job
 

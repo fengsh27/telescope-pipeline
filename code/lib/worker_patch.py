@@ -56,7 +56,7 @@ import math
 import os
 import pandas as pd
 import pysam
-from shutil import move, rmtree, copyfileobj, copyfile
+from shutil import move, rmtree, copyfileobj, copyfile, copytree
 import subprocess
 import sys
 import time
@@ -481,7 +481,8 @@ class PatchedWorker:
     def telescope(self, sample_info: Dict[str, Any], output_dpath: str, n_cores: int, herv_gtf_fpath: str, sample: str) -> Dict[str, Any]:
         """ Run Telescope assign on a prepared BAM in the per-sample outdir. """
         s_time = time.time()
-        cols = ['status', 'note', 'sample_id', 'cohort_id', 'stranded_mode', 'telescope', 'telescope_time_in_sec']
+        cols = ['status', 'note', 'sample_id', 'cohort_id', 'stranded_mode', 'telescope',
+                'telescope_time_in_sec', 'telescope_max_rss_gb']
 
         # Never fall back to Telescope's default here: a sample whose mode was
         # lost would be counted unstranded without anyone noticing.
@@ -506,8 +507,12 @@ class PatchedWorker:
                 f"{sample}: {bam_fpath} is coordinate-sorted; Telescope needs each "
                 "read's alignments contiguous. Re-run step 1 for this sample.")
 
+        # /usr/bin/time -v records this sample's own peak memory. sacct's MaxRSS
+        # cannot: it is one number per job, and samples run concurrently.
+        time_fpath = os.path.join(telescope_dpath, f'{sample}_telescope.time')
+        timer = f"/usr/bin/time -v -o {time_fpath} " if os.path.exists('/usr/bin/time') else ''
         cmd = (
-            "telescope assign "
+            f"{timer}telescope assign "
             f"{os.path.join(telescope_dpath, f'{sample}.bam')} "
             f"{herv_gtf_fpath} "
             f"--ncpu {n_cores} "
@@ -535,10 +540,48 @@ class PatchedWorker:
             'status': 'Ok', 'note': '', 'sample_id': sample,
             'cohort_id': sample_info.get(sample, {}).get('cohort_id', ''),
             'stranded_mode': mode,
-            'telescope': 'Ok', 'telescope_time_in_sec': round(time.time() - s_time, 2)
+            'telescope': 'Ok', 'telescope_time_in_sec': round(time.time() - s_time, 2),
+            'telescope_max_rss_gb': self.max_rss_gb(time_fpath),
         }
+        # The sample's own log row, next to its counts, so it survives even if
+        # the job dies before logs.tsv is copied back.
+        with open(os.path.join(telescope_dpath, f'{sample}_telescope_summary.tsv'), 'w') as f:
+            f.write('\t'.join(cols) + '\n' + '\t'.join(str(d[c]) for c in cols) + '\n')
+        self.publish_sample(telescope_dpath, sample)
         print('\t'.join([str(d[c]) for c in cols]))
         return d
+
+    @staticmethod
+    def max_rss_gb(time_fpath: str):
+        """Peak RSS in GB from a /usr/bin/time -v report ('' if unavailable)."""
+        try:
+            with open(time_fpath) as f:
+                for line in f:
+                    if 'Maximum resident set size' in line:
+                        return round(int(line.rsplit(':', 1)[1]) / 1024 ** 2, 2)
+        except (OSError, ValueError):
+            pass
+        return ''
+
+    def publish_sample(self, telescope_dpath: str, sample: str) -> None:
+        """Copy one finished sample's outputs to --final_dir right away.
+
+        Results used to be copied back only at the end of the job, so a job
+        killed late (e.g. out of memory on its largest sample) lost every
+        sample, finished or not. Copy to <sample>.partial and rename, so a
+        half-copied directory is never mistaken for a finished one.
+        """
+        final_root = getattr(self.cmd_obj, 'final_dir', '')
+        if not final_root:
+            return
+        dst = os.path.join(final_root, sample)
+        tmp = dst + '.partial'
+        for p in (tmp, dst):
+            if os.path.exists(p):
+                self.delete_file_or_dir(p)
+        self.create_dir(final_root)
+        copytree(telescope_dpath, tmp)
+        os.rename(tmp, dst)
 
     # ------------------------------------------------------------------
     # Small utilities
@@ -720,6 +763,16 @@ class PatchedWorker:
 
             for sample, info in sample_info_tele.items():
                 bam_fpath = os.path.join(scratch_path, f'{sample}.bam')
+                final_root = getattr(self.cmd_obj, 'final_dir', '')
+                done = os.path.join(final_root, sample, f'{sample}-TE_counts.tsv') if final_root else ''
+                if done and os.path.isfile(done) and os.path.getsize(done) > 0:
+                    # finished by an earlier (e.g. killed) run of this job; its
+                    # outputs were already published to --final_dir
+                    logs_map[sample] = {'status': 'Ok', 'note': 'already done (kept from an earlier run)',
+                                        'sample_id': sample, 'cohort_id': info.get('cohort_id', ''),
+                                        'stranded_mode': info['stranded_mode'], 'telescope': 'Skipped'}
+                    print('\t'.join(['Ok', 'already done', sample]))
+                    continue
                 if info['stranded_mode'] not in strand_lib.TELESCOPE_MODES:
                     logs_map[sample] = {
                         'status': 'Err', 'sample_id': sample, 'cohort_id': info.get('cohort_id', ''),

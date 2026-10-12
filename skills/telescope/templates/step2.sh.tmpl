@@ -40,6 +40,10 @@ PY
 PROJECT_PATH="{{PROJECT}}"
 
 cp -R "{{CODE_DIR}}/lib" "{{CODE_DIR}}/run.py" "${PFSDIR}/"
+# Each sample is copied here by run.py as soon as it finishes (--final_dir),
+# so a job killed later -- e.g. out of memory on its largest sample -- keeps
+# every sample that had already completed. The rsync below is a final sweep.
+mkdir -p "${PROJECT_PATH}/output/TELESCOPE"
 cd "${PFSDIR}"
 mkdir -p output
 
@@ -55,7 +59,8 @@ python run.py \
   --n_cores "${SLURM_CPUS_PER_TASK}" \
   --trimgalore_n_cores {{TRIMGALORE_N_CORES}} \
   --telescope_n_cores 1 \
-  --telescope_n_samples {{S2_CONCURRENT}} \
+  --telescope_n_samples "${S2_CONCURRENT_OVERRIDE:-{{S2_CONCURRENT}}}" \
+  --final_dir "${PROJECT_PATH}/output/TELESCOPE" \
   --seed {{SEED}} \
   --fastq_mode && rc=0 || rc=$?
 
