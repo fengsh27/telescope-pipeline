@@ -786,7 +786,12 @@ class PatchedWorker:
                     if os.path.isdir(tele_dpath):
                         self.delete_file_or_dir(tele_dpath)
                     self.create_dir(tele_dpath)
-                    copyfile(bam_fpath, os.path.join(tele_dpath, f'{sample}.bam'))
+                    # Link, don't copy: the BAM is already on the same scratch
+                    # filesystem, and copying a manifest's -k 100 BAMs (100-270 GB)
+                    # into $PFSDIR only doubled step 2's disk use. telescope()
+                    # removes the link afterwards; the BAM itself stays in tmp_<N>
+                    # until the job template reclaims it.
+                    os.symlink(os.path.abspath(bam_fpath), os.path.join(tele_dpath, f'{sample}.bam'))
                     init_samples.append(sample)
                     logs_map.setdefault(sample, {
                         'status': 'Ok', 'note': '', 'sample_id': sample, 'cohort_id': info.get('cohort_id', '')
