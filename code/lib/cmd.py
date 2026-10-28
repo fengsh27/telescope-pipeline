@@ -193,7 +193,39 @@ class CmdParser():
         cmd_args.add_argument(
             '--fastq_mode',
             action='store_true',
-            help='Fastq mode, read local fastq files'
+            help='Manifest mode (FASTQ and/or BAM rows), not the legacy GDC download path'
+        )
+
+        cmd_args.add_argument(
+            '--strand_n_reads',
+            type=int,
+            default=1000000,
+            required=False,
+            help='Reads sampled when strandedness has to be measured in step 1 (default: 1000000)'
+        )
+
+        cmd_args.add_argument(
+            '--kallisto_index',
+            type=str,
+            default='',
+            required=False,
+            help='kallisto index for FASTQ strandedness; built here if missing (default: per job)'
+        )
+
+        cmd_args.add_argument(
+            '--final_dir',
+            type=str,
+            default='',
+            required=False,
+            help='TELESCOPE: copy each sample here as soon as it finishes (project output/TELESCOPE)'
+        )
+
+        cmd_args.add_argument(
+            '--bam2fq_exclude_flags',
+            type=str,
+            default='0xB00',
+            required=False,
+            help='samtools fastq -F for BAM rows (default 0xB00: secondary, supplementary, QC-fail)'
         )
               
         args = cmd_args.parse_args()      
@@ -226,6 +258,10 @@ class CmdParser():
         self.manifest: str = args.manifest
         self.samples_dir: str = args.samples_dir
         self.fastq_mode: bool = args.fastq_mode
+        self.strand_n_reads: int = args.strand_n_reads
+        self.kallisto_index: str = args.kallisto_index
+        self.bam2fq_exclude_flags: str = args.bam2fq_exclude_flags
+        self.final_dir: str = args.final_dir.rstrip('/')
 
         if not self.fastq_mode and not os.path.isfile(self.gdc_cl):
             self.print_error_and_abort('ERROR. No GDC client found')
@@ -245,7 +281,8 @@ class CmdParser():
         if self.fastq_mode and ("BOWTIE" in self.workflows) and not os.path.isfile(self.manifest):
             self.print_error_and_abort('ERROR. No manifest found')
 
-        if self.fastq_mode and ("BOWTIE" in self.workflows) and not os.path.isdir(self.samples_dir):
+        if self.fastq_mode and ("BOWTIE" in self.workflows) and self.samples_dir \
+                and not os.path.isdir(self.samples_dir):
             self.print_error_and_abort('ERROR, No samples directory found ')
             
         if not os.path.isdir(self.out_dir):

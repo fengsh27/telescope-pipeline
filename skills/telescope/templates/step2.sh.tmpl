@@ -40,6 +40,10 @@ PY
 PROJECT_PATH="{{PROJECT}}"
 
 cp -R "{{CODE_DIR}}/lib" "{{CODE_DIR}}/run.py" "${PFSDIR}/"
+# Each sample is copied here by run.py as soon as it finishes (--final_dir),
+# so a job killed later -- e.g. out of memory on its largest sample -- keeps
+# every sample that had already completed. The rsync below is a final sweep.
+mkdir -p "${PROJECT_PATH}/output/TELESCOPE"
 cd "${PFSDIR}"
 mkdir -p output
 
@@ -55,7 +59,8 @@ python run.py \
   --n_cores "${SLURM_CPUS_PER_TASK}" \
   --trimgalore_n_cores {{TRIMGALORE_N_CORES}} \
   --telescope_n_cores 1 \
-  --telescope_n_samples {{S2_CONCURRENT}} \
+  --telescope_n_samples "${S2_CONCURRENT_OVERRIDE:-{{S2_CONCURRENT}}}" \
+  --final_dir "${PROJECT_PATH}/output/TELESCOPE" \
   --seed {{SEED}} \
   --fastq_mode && rc=0 || rc=$?
 
@@ -70,10 +75,20 @@ if [ -d output/TELESCOPE ]; then
 fi
 
 # Only reclaim the BAMs once every sample in this manifest produced a counts file.
+# Optionally mark each finished sample (e.g. for gdc-download cleanup): the
+# config's done_marker with {sample} replaced, touched only when counts exist.
+DONE_MARKER="{{DONE_MARKER}}"
 missing=0
 while IFS=$'\t' read -r s _; do
   [ "$s" = "sample" ] && continue
-  [ -s "${PROJECT_PATH}/output/TELESCOPE/${s}/${s}-TE_counts.tsv" ] || { echo "MISSING counts: $s"; missing=1; }
+  if [ -s "${PROJECT_PATH}/output/TELESCOPE/${s}/${s}-TE_counts.tsv" ]; then
+    if [ -n "$DONE_MARKER" ]; then
+      m="${DONE_MARKER//\{sample\}/$s}"
+      mkdir -p "$(dirname "$m")" && touch "$m"
+    fi
+  else
+    echo "MISSING counts: $s"; missing=1
+  fi
 done < "${PROJECT_PATH}/manifests/manifest_{{ID}}.tsv"
 
 if [ "$missing" -eq 0 ] && [ "$rc" -eq 0 ]; then
