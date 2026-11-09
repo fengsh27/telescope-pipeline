@@ -19,11 +19,13 @@ extension and RSeQC's dependencies) and needs a C compiler on PATH; the
 system gcc on OSC is enough. Run it on a login node once per cluster account,
 not inside a job.
 
-Telescope's C extension: the historical env was compiled with icc and has
-undefined `__intel_*` symbols, which is why the step-2 template LD_PRELOADs
-the Intel runtime. A fresh gcc build does not need that; the verification
-reports which case the env is in. The preload in the template is harmless
-either way, so it stays.
+Telescope's C extension: OSC login shells export CC=icc (the intel module is
+loaded by default) and pip honours it, so the historical env's extension was
+compiled with icc, has undefined `__intel_*` symbols, and loads only with the
+Intel runtime LD_PRELOADed -- which is why the step-2 template does that.
+This script forces CC=gcc while creating the env, so the extension loads on
+its own; the verification reports which case an env is in. The preload in
+the template is harmless either way, so it stays.
 
 Python 3.6 compatible (runs under the env's interpreter and the system 3.9).
 """
@@ -85,8 +87,19 @@ def intel_preload(cfg):
 def create_env(cfg, env_file, stream=True):
     target = cfg["conda_env"]
     flag = "-p" if "/" in target else "-n"
+    # OSC login shells export CC/CXX/FC pointing at the Intel compilers (the
+    # intel module is loaded by default), and pip honours $CC when it builds
+    # Telescope's Cython extension. An icc build has undefined __intel_*
+    # symbols and loads only with the Intel runtime LD_PRELOADed -- which is
+    # how the original env came to need that. Build with gcc instead so the
+    # env does not depend on the Intel runtime at all.
+    compilers = ""
+    if shutil.which("gcc"):
+        compilers = ("export CC=gcc CXX=g++; unset FC LDSHARED\n"
+                     "echo \"building C extensions with $(gcc --version | head -1)\"\n")
     script = (conda_prelude(cfg)
               + f"set -o pipefail\n"
+              + compilers
               + f"echo \"creating conda env {target} from {env_file}\"\n"
               + f"conda env create {flag} {shlex.quote(target)} -f {shlex.quote(env_file)}\n")
     return run_bash(script, stream=stream)

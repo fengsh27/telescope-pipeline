@@ -8,12 +8,15 @@
 # or by hand:
 #
 #   module load miniconda3/24.1.2-py310
+#   export CC=gcc CXX=g++      # OSC login shells export CC=icc; pip would use it
 #   conda env create -n immuno_telescope -f skills/telescope/environment.yml
 #
 # Telescope (telescope-ngs) is installed from its git commit and compiles a
 # Cython extension on install, so a C compiler must be on PATH (the system
-# gcc on OSC is enough). Python stays at 3.6: the pinned pysam/cutadapt/
-# numpy builds exist only for py36, and the pipeline code is written for it.
+# gcc on OSC is enough; built with icc instead, the extension needs the Intel
+# runtime preloaded at run time). Python stays at 3.6: the pinned pysam/
+# cutadapt/numpy builds exist only for py36, and the pipeline code is written
+# for it.
 name: immuno_telescope
 channels:
   - conda-forge

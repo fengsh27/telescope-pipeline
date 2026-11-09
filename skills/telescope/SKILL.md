@@ -96,11 +96,16 @@ Jupyter and the plotting packages in `requirements.txt` are not part of it;
 the pipeline never imports them. Do not bump Python: the pinned py36 builds
 are the ones the results were produced with.
 
-The Intel-runtime note: the original env's Telescope extension was compiled
-with icc and only loads with `libimf/libsvml/libirc` preloaded, which is why
-the step-2 template does that. An env built from `environment.yml` compiles
-the extension with gcc and loads without it. `setup_env.py` reports which case
-applies; the template's preload is harmless in both, so keep it.
+The Intel-runtime note: OSC login shells export `CC`/`CXX`/`FC` pointing at
+the Intel compilers (the `intel` module is loaded by default), and pip honours
+`$CC` when it compiles Telescope's Cython extension. The original env was
+built that way, so its extension has undefined `__intel_*` symbols and loads
+only with `libimf/libsvml/libirc` preloaded — which is why the step-2 template
+does that. `setup_env.py` exports `CC=gcc CXX=g++` while creating the env, so
+an env it builds loads without the Intel runtime (verified: zero Intel symbols
+in the `.so`). It reports which case an env is in; the template's preload is
+harmless in both, so keep it. If you create the env by hand, set `CC=gcc`
+first or you will get the icc build again.
 
 ## 1. Validate the FASTQ files
 
