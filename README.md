@@ -30,14 +30,17 @@ is deleted only after every sample in that manifest has a counts file.
 | `code/lib/cmd.py` | Command-line arguments |
 | `code/lib/worker.py` | Original upstream version (GDC download path); not used |
 | `skills/telescope/` | Scripts, job templates and config for running a cohort — **use these** |
+| `skills/telescope/environment.yml` | The `immuno_telescope` conda env, pinned; `setup_env.py` builds it |
 | `osc_job_generation.ipynb`, `jobs_step*/`, `manifests/` | Legacy job generator and example outputs; out of date |
-| `requirements.txt` | Frozen `immuno_telescope` conda environment |
+| `requirements.txt` | `pip freeze` of the original env (includes Jupyter/plotting packages the pipeline does not use) |
 
 ## Requirements
 
 - OSC account `PDE0005`, partition `nextgen`
 - Conda environment `immuno_telescope` (Python 3.6, telescope-ngs `4cf1859`,
-  bowtie2 2.5.4, samtools 1.9, Trim Galore, RSeQC — see `requirements.txt`)
+  bowtie2 2.5.4, samtools 1.9, Trim Galore, kallisto, RSeQC). Created from
+  `skills/telescope/environment.yml` by `setup_env.py` (step 0 below) if it
+  does not exist yet.
 - Modules `miniconda3/24.1.2-py310` and `intel/2021.10.0`
 - References in `/fs/ess/PDE0005/telescope_refs/data`:
 
@@ -105,6 +108,18 @@ A BAM cohort, e.g. one gdc-download batch (samples are named by GDC file id):
 ```
 
 Leave `done_marker` empty for pilots whose inputs must not be cleaned up.
+
+**0b. Make sure the conda env exists** (creates `conda_env` from
+`environment.yml` if missing, then verifies every tool inside it; 10–30 min
+the first time, once per account):
+
+```bash
+python skills/telescope/scripts/setup_env.py --config /fs/scratch/PDE0005/projects/MYPROJECT/telescope.config.json
+python skills/telescope/scripts/setup_env.py --config ... --check    # verify only
+```
+
+`submit.py` also refuses a batch when the env is missing, since every job
+starts with `conda activate`.
 
 **1. Check FASTQ integrity** (`gzip -t` on every file; results are cached;
 FASTQ cohorts only):

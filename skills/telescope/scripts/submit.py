@@ -22,7 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (add_config_arg, load_config, parse_ids, manifest_path,  # noqa: E402
                      read_manifest_rows, sample_inputs, job_name, queued_job_names, human,
-                     STRANDED_MODES)
+                     STRANDED_MODES, conda_env_path, setup_env_hint)
 
 DIRECTIVES = ("partition", "time", "cpus-per-task", "mem", "account")
 
@@ -41,7 +41,7 @@ def directives_of(path):
     return got
 
 
-def check_environment(cfg, step):
+def check_environment(cfg, step, config_path="telescope.config.json"):
     """Split into fatal and advisory.
 
     Only some of the --gtf/--genome/--transcript paths are actually opened by
@@ -54,6 +54,15 @@ def check_environment(cfg, step):
         p = os.path.join(cfg["code_dir"], rel)
         if not os.path.exists(p):
             fatal.append(f"code_dir is missing {rel}: {p}")
+
+    # Every job starts with `conda activate <conda_env>`; a missing env kills
+    # the whole batch within seconds of landing on a node.
+    env_path, err = conda_env_path(cfg)
+    if err:
+        warn.append(f"could not check that conda env {cfg['conda_env']!r} exists: {err}")
+    elif not env_path:
+        fatal.append(f"conda env {cfg['conda_env']!r} does not exist; create it with\n"
+                     f"    {setup_env_hint(config_path)}")
 
     herv = os.path.join(cfg["ref_dir"], cfg["herv_gtf"])
     if not os.path.isfile(herv):
@@ -261,7 +270,7 @@ def main():
     if not ids:
         sys.exit("--ids selected nothing")
 
-    fatal, warn = check_environment(cfg, step)
+    fatal, warn = check_environment(cfg, step, args.config)
     for w in warn:
         print(f"WARNING: {w}", file=sys.stderr)
     if fatal:

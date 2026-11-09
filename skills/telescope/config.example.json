@@ -8,6 +8,7 @@
   "account":      "PDE0005",
   "partition":    "nextgen",
   "job_prefix":   "myproj",
+  "_comment_env": "conda_env is created from environment.yml by scripts/setup_env.py when it does not exist (a name, or a prefix path)",
   "conda_env":    "immuno_telescope",
   "seed":         123456,
 

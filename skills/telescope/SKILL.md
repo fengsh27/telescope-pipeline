@@ -1,6 +1,6 @@
 ---
 name: telescope
-description: Run the two-step Bowtie2 -> Telescope HERV/LINE quantification pipeline on an OSC Slurm cluster, from paired FASTQ or aligned BAM (e.g. GDC) input. Use when asked to validate FASTQ files, determine library strandedness / Telescope --stranded_mode, build manifests, generate step-1 (BOWTIE) or step-2 (TELESCOPE) job scripts, or submit/resubmit those jobs. Covers gzip integrity checks, strandedness calls, BAM->FASTQ conversion, 4-sample manifests, SLURM script generation, and guarded batch submission.
+description: Run the two-step Bowtie2 -> Telescope HERV/LINE quantification pipeline on an OSC Slurm cluster, from paired FASTQ or aligned BAM (e.g. GDC) input. Use when asked to set up or verify the pipeline's conda environment, validate FASTQ files, determine library strandedness / Telescope --stranded_mode, build manifests, generate step-1 (BOWTIE) or step-2 (TELESCOPE) job scripts, or submit/resubmit those jobs. Covers conda env creation from environment.yml, gzip integrity checks, strandedness calls, BAM->FASTQ conversion, 4-sample manifests, SLURM script generation, and guarded batch submission.
 ---
 
 # Telescope pipeline
@@ -15,8 +15,8 @@ Two steps, one manifest at a time:
 Step 2 deletes `tmp_<N>` only after every sample in that manifest has a counts
 file, so `tmp_<N>` is the handoff between the steps and the rerun safety net.
 
-Order of work: **check_fastq (FASTQ only) → check_strandedness → make_manifests
---require-strand → make_jobs → submit step 1 → submit step 2.**
+Order of work: **setup_env → check_fastq (FASTQ only) → check_strandedness →
+make_manifests --require-strand → make_jobs → submit step 1 → submit step 2.**
 
 ## Input: FASTQ or BAM
 
@@ -61,6 +61,46 @@ cp -r code <project>/code && git rev-parse --short HEAD > <project>/code/SNAPSHO
 kallisto). When editing, stay 3.6-compatible: no `capture_output=`/`text=`
 in `subprocess.run` (use `stdout=PIPE, stderr=PIPE, universal_newlines=True`),
 no walrus operator, no `dict | dict`.
+
+## 0. Make sure the conda environment exists
+
+```bash
+python skills/telescope/scripts/setup_env.py --config telescope.config.json
+```
+
+Every job script and `check_strandedness.py` begin with `module load
+<conda_module>; conda activate <conda_env>` and die within seconds if the env
+is missing. `setup_env.py` creates `conda_env` from `environment.yml` when it
+does not exist, then activates it and verifies every tool the pipeline shells
+out to (telescope, bowtie2, samtools, trim_galore, cutadapt, pigz, kallisto,
+`infer_experiment.py`, `check_strandedness`) and every module `code/lib`
+imports, plus a `ctypes` load of Telescope's C extension. `submit.py` runs the
+existence check too and refuses a batch when the env is absent.
+
+- `--check` — verify only, never create (exit 1 if missing or broken)
+- `--dry-run` — say whether it would create
+- `--recreate` — remove and rebuild. **Only while no job that activates this
+  env is queued or running**: a job activates the env at start time.
+- `--env-file` — build from another YAML (default: the skill's)
+
+Creating takes 10–30 min on a login node (solve, then `pip` compiles
+Telescope's Cython extension and RSeQC's deps; the system `gcc` suffices).
+It is a once-per-account task, not a per-project one: the env name is in the
+config (`conda_env`, default `immuno_telescope`) and all projects share it.
+
+`environment.yml` pins the versions the cohorts were run with: Python 3.6.10,
+telescope-ngs at commit `4cf1859` (from git), bowtie2 2.5.4, samtools 1.9,
+Trim Galore 0.6.10 / cutadapt 3.5, kallisto 0.44.0, RSeQC 5.0.4,
+how-are-we-stranded-here 1.0.1, pysam 0.15.2, numpy 1.16.3, pandas 1.1.3.
+Jupyter and the plotting packages in `requirements.txt` are not part of it;
+the pipeline never imports them. Do not bump Python: the pinned py36 builds
+are the ones the results were produced with.
+
+The Intel-runtime note: the original env's Telescope extension was compiled
+with icc and only loads with `libimf/libsvml/libirc` preloaded, which is why
+the step-2 template does that. An env built from `environment.yml` compiles
+the extension with gcc and loads without it. `setup_env.py` reports which case
+applies; the template's preload is harmless in both, so keep it.
 
 ## 1. Validate the FASTQ files
 
@@ -186,6 +226,7 @@ Preflight runs first and aborts the whole batch if anything fails:
 
 | check | step 1 | step 2 |
 |-------|--------|--------|
+| conda env `conda_env` exists (else: run `setup_env.py`) | ✓ | ✓ |
 | job script exists and `bash -n` passes | ✓ | ✓ |
 | manifest exists | ✓ | ✓ |
 | every input present and non-empty | FASTQ pair or BAM | `tmp_<N>/<s>.bam` |
@@ -332,8 +373,10 @@ Two cautions from this pipeline's history:
 skills/telescope/
   SKILL.md                    this file
   config.example.json         copy to <project>/telescope.config.json and edit
+  environment.yml             the conda env (pinned); setup_env.py builds from it
   scripts/
-    _common.py                config loading, id ranges, manifest parsing
+    _common.py                config loading, id ranges, manifest parsing, conda helpers
+    setup_env.py              create conda_env from environment.yml if missing, verify tools
     check_fastq.py            gzip -t sweep, cached, local or Slurm array
     check_strandedness.py     stranded_mode per sample -> qc/strandedness.tsv
     make_manifests.py         FASTQ pairs or bam_table -> manifest_<N>.tsv

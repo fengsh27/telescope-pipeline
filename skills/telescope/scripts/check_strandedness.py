@@ -29,7 +29,7 @@ from concurrent.futures import ProcessPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (add_config_arg, load_config, discover_samples, input_stamp,  # noqa: E402
                      load_strand_table, write_strand_table, strand_table_path, overrides_path,
-                     load_overrides, human, SKILL_DIR, STRAND_COLS)
+                     load_overrides, human, SKILL_DIR, STRAND_COLS, conda_env_path, setup_env_hint)
 
 TOOLS = {"bam": ("samtools", "infer_experiment.py"),
          "fastq": ("check_strandedness", "kallisto", "infer_experiment.py")}
@@ -203,8 +203,13 @@ def main():
 
     missing_tools = [t for t in TOOLS[kind] if not shutil.which(t)]
     if missing_tools and not args.slurm:
-        sys.exit(f"not on PATH: {', '.join(missing_tools)}\n"
-                 f"  conda activate {cfg['conda_env']}  (or use --slurm --submit)")
+        env_path, _ = conda_env_path(cfg)
+        if env_path:
+            hint = f"  conda activate {cfg['conda_env']}  (or use --slurm --submit)"
+        else:
+            hint = (f"  conda env {cfg['conda_env']!r} does not exist yet; create it with\n"
+                    f"    {setup_env_hint(args.config)}")
+        sys.exit(f"not on PATH: {', '.join(missing_tools)}\n{hint}")
 
     os.makedirs(qc, exist_ok=True)
     if args.slurm:

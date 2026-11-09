@@ -1,0 +1,58 @@
+# Conda environment for the Telescope pipeline (steps 1 and 2 and the QC
+# scripts). Pinned to the versions of the `immuno_telescope` env the cohorts
+# were run with (see requirements.txt for the full freeze, incl. Jupyter and
+# plotting packages the pipeline itself does not use).
+#
+#   python skills/telescope/scripts/setup_env.py --config telescope.config.json
+#
+# or by hand:
+#
+#   module load miniconda3/24.1.2-py310
+#   conda env create -n immuno_telescope -f skills/telescope/environment.yml
+#
+# Telescope (telescope-ngs) is installed from its git commit and compiles a
+# Cython extension on install, so a C compiler must be on PATH (the system
+# gcc on OSC is enough). Python stays at 3.6: the pinned pysam/cutadapt/
+# numpy builds exist only for py36, and the pipeline code is written for it.
+name: immuno_telescope
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.6.10
+  - pip=21.3.1
+  - setuptools=58.0.4
+
+  # step 1: trim + align + BAM handling
+  - bowtie2=2.5.4
+  - samtools=1.9
+  - htslib=1.9
+  - trim-galore=0.6.10
+  - cutadapt=3.5
+  - pigz=2.8
+
+  # strandedness (check_strandedness pseudo-aligns a read sample with kallisto)
+  - kallisto=0.44.0
+
+  # Telescope's Python dependencies (its setup.py imports numpy and cython)
+  - cython=0.29.7
+  - numpy=1.16.3
+  - scipy=1.2.1
+  - pysam=0.15.2
+  - intervaltree=3.0.2
+  - future=0.18.2
+  - pyyaml=5.4.1
+
+  # pipeline code
+  - pandas=1.1.3
+
+  - pip:
+      # telescope assign; commit 4cf1859 is what every cohort so far used
+      - git+https://github.com/mlbendall/telescope.git@4cf18595eea1702775e8a8bbc7b37ebac9233fd5#egg=telescope-ngs
+      # infer_experiment.py (strandedness of a BAM), and its deps
+      - RSeQC==5.0.4
+      - bx-python==0.8.12
+      - pyBigWig==0.3.18
+      # check_strandedness (strandedness of a FASTQ pair)
+      - how-are-we-stranded-here==1.0.1

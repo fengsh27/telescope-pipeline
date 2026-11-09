@@ -209,6 +209,76 @@ def human(n):
 
 
 # ---------------------------------------------------------------------------
+# conda (the env every job script and check_strandedness.py activates)
+# ---------------------------------------------------------------------------
+
+ENV_FILE = os.path.join(SKILL_DIR, "environment.yml")
+CONDA_UNAVAILABLE_RC = 97
+
+
+def conda_prelude(cfg):
+    """Bash that makes `conda activate` work, exactly as the job templates do it.
+
+    `module` is a shell function; on OSC it is also available to non-interactive
+    bash through BASH_ENV, so `module load` works from subprocess as it does in
+    an sbatch script. Exits CONDA_UNAVAILABLE_RC when conda is still not found.
+    """
+    return (
+        f"module load {cfg['conda_module']} >/dev/null 2>&1 || true\n"
+        f"if ! command -v conda >/dev/null 2>&1; then\n"
+        f"  echo 'conda not on PATH (module {cfg['conda_module']} did not provide it)' >&2\n"
+        f"  exit {CONDA_UNAVAILABLE_RC}\n"
+        f"fi\n"
+        f'source "$(conda info --base)/etc/profile.d/conda.sh"\n'
+    )
+
+
+def run_bash(script, stream=False, timeout=None):
+    """Run a bash script -> (rc, combined output). stream=True also echoes it live."""
+    p = subprocess.Popen(["bash", "-c", script], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, universal_newlines=True)
+    chunks = []
+    if stream:
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            chunks.append(line)
+        p.wait(timeout=timeout)
+    else:
+        out, _ = p.communicate(timeout=timeout)
+        chunks.append(out or "")
+    return p.returncode, "".join(chunks)
+
+
+def conda_env_path(cfg):
+    """-> (path or None, error). conda_env may be a name or a prefix path.
+
+    path None + error '' means conda is reachable and the env does not exist;
+    error set means the question could not be answered here (no conda).
+    """
+    rc, out = run_bash(conda_prelude(cfg) + "conda env list --json", timeout=120)
+    if rc != 0:
+        return None, " ".join(out.split())[-300:] or f"conda env list failed (rc={rc})"
+    try:
+        envs = json.loads(out[out.index("{"):]).get("envs", [])
+    except (ValueError, KeyError):
+        return None, "could not parse `conda env list --json`"
+    want = cfg["conda_env"]
+    by_prefix = "/" in want
+    want_abs = os.path.abspath(os.path.expanduser(want)).rstrip("/")
+    for p in envs:
+        p = p.rstrip("/")
+        if (p == want_abs) if by_prefix else (os.path.basename(p) == want):
+            return p, ""
+    return None, ""
+
+
+def setup_env_hint(config_path):
+    return (f"python {os.path.join(SKILL_DIR, 'scripts', 'setup_env.py')} "
+            f"--config {config_path}")
+
+
+# ---------------------------------------------------------------------------
 # strandedness table (written by check_strandedness.py, read by make_manifests.py)
 # ---------------------------------------------------------------------------
 
